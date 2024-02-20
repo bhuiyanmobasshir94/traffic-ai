@@ -6,11 +6,8 @@ authors = ["bhuiyanmobasshir94"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.9"
+python = ">=3.9,<3.9.7 || >3.9.7,<4.0"
 streamlit = "^1.31.1"
-numpy = "^1.26.4"
-opencv-python = "^4.9.0.80"
-watchdog = "^4.0.0"
 folium = "^0.15.1"
 streamlit-folium = "^0.18.0"
 
