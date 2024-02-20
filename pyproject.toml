@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "traffic-ai"
+version = "0.1.0"
+description = ""
+authors = ["bhuiyanmobasshir94"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+streamlit = "^1.31.1"
+numpy = "^1.26.4"
+opencv-python = "^4.9.0.80"
+watchdog = "^4.0.0"
+folium = "^0.15.1"
+streamlit-folium = "^0.18.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
