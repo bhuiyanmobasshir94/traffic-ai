@@ -5,6 +5,86 @@ import pandas as pd
 import time
 import random
 
+PATHA = [
+    [90.422716, 23.825473],
+    [90.428467, 23.826572],
+    [90.433874, 23.827907],
+    [90.439625, 23.82877],
+    [90.444174, 23.829791],
+    [90.449066, 23.830733],
+    [90.453014, 23.831518],
+    [90.45722, 23.832618],
+    [90.463057, 23.833795],
+    [90.468636, 23.835444],
+    [90.474043, 23.836386],
+    [90.479794, 23.837171],
+    [90.486832, 23.837721],
+    [90.496616, 23.83725],
+    [90.506487, 23.837328],
+    [90.511551, 23.837093],
+    [90.518847, 23.837407],
+    [90.52331, 23.837093],
+    [90.526915, 23.834659],
+    [90.52906, 23.834423],
+    [90.533438, 23.834659],
+    [90.538845, 23.834502],
+    [90.54039, 23.834502],
+    [90.542793, 23.835051],
+    [90.545969, 23.836465],
+    [90.548973, 23.837093],
+]
+PATHA = list(map(lambda x: [x[1], x[0]], PATHA))
+PATHB = [
+    [90.385551, 23.937938],
+    [90.390015, 23.926641],
+    [90.395508, 23.914401],
+    [90.398598, 23.902788],
+    [90.400314, 23.892744],
+    [90.400658, 23.883012],
+    [90.400658, 23.874222],
+    [90.400658, 23.862606],
+    [90.408211, 23.850674],
+    [90.41954, 23.839055],
+    [90.4216, 23.826179],
+]
+PATHB = list(map(lambda x: [x[1], x[0]], PATHB))
+PATHC = [
+    [90.422974, 23.825237],
+    [90.419884, 23.82084],
+    [90.410957, 23.816757],
+    [90.404778, 23.812046],
+    [90.402031, 23.803879],
+    [90.401001, 23.792884],
+    [90.398941, 23.780946],
+    [90.395851, 23.770578],
+    [90.394821, 23.762723],
+    [90.394478, 23.759267],
+]
+PATHC = list(map(lambda x: [x[1], x[0]], PATHC))
+
+congested_paths = [
+    {
+        "path": PATHA,
+        "congestion_level": "High",
+    },
+    {"path": PATHB, "congestion_level": "Medium"},
+    {
+        "path": PATHC,
+        "congestion_level": "Low",
+    },
+]
+
+
+def get_congestion_color(congestion_level):
+    if congestion_level == "High":
+        return "red"
+    elif congestion_level == "Medium":
+        return "orange"
+    elif congestion_level == "Low":
+        return "green"
+    else:
+        return "blue"
+
 
 def cook_breakfast():
     msg = st.toast("Gathering informations...")
@@ -203,6 +283,14 @@ def show_toll_booth_page():
             folium.Marker(
                 [23.836842165760064, 90.47714944282039], popup="Toll Plaza B"
             ).add_to(m)
+
+            for path_data in congested_paths:
+                folium.PolyLine(
+                    path_data["path"],
+                    color=get_congestion_color(path_data["congestion_level"]),
+                    weight=10,
+                ).add_to(m)
+
             st_data = st_folium(m, width=1050, height=240)
 
     with col2:
@@ -275,6 +363,14 @@ def show_congestion_page():
             folium.Marker(
                 [23.836842165760064, 90.47714944282039], popup="Toll Plaza B"
             ).add_to(m)
+
+            for path_data in congested_paths:
+                folium.PolyLine(
+                    path_data["path"],
+                    color=get_congestion_color(path_data["congestion_level"]),
+                    weight=10,
+                ).add_to(m)
+
             st_data = st_folium(m, width=1050, height=240)
 
     with col2:
