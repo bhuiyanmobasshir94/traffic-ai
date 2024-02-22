@@ -245,7 +245,7 @@ def main():
 
 def show_toll_booth_page():
     MAPPER = {
-        "Toll Plaza A": {"video": "https://www.youtube.com/embed/KTkHeOmKV6g"},
+        "Toll Plaza A": {"video": "https://www.youtube.com/embed/ckoAwzsCOxo"},
         "Toll Plaza B": {"video": "https://www.youtube.com/embed/aTJVDGKHAHU"},
     }
 
