@@ -163,9 +163,25 @@ def main():
         page_icon="🧊",
         initial_sidebar_state="auto",
     )
+    css = """
+        [data-testid="stAppViewBlockContainer"] {
+            padding-top: 60px;
+            padding-bottom: 60px;
+        }
+        [data-testid="stButton"] {
+            padding-top: 50px;
+        }
+        [data-testid="stSidebarNav"] {
+            position:absolute;
+            bottom: 75%;
+        }
+        [data-testid="stSidebarNavSeparator"] {
+            display: none;
+        }
+        """
+
+    st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
     # Sidebar menu
-    st.sidebar.image("logo.png", caption="Graaho Technologies", width=150)
-    
     ms = st.session_state
 
     if "themes" not in ms:
@@ -219,19 +235,12 @@ def main():
         ms.themes["refreshed"] = True
         st.rerun()
 
-    # st._config.set_option("layout", "wide")
-    # menu_choice = st.sidebar.radio("Services", ("Toll Booth", "Traffic Analysis"))
-
+    st.sidebar.image("logo.png", caption="Graaho Technologies", width=130)
     c1, c2, c3 = st.columns((2, 2, 2))
-    # c1.button(btn_face, on_click=ChangeTheme)
+    c1.button(btn_face, on_click=ChangeTheme)
     c2.title("Toll Booth")
     # c3.button(btn_face, on_click=ChangeTheme)
     show_toll_booth_page()
-
-    # if menu_choice == "Toll Booth":
-    #     show_toll_booth_page()
-    # elif menu_choice == "Traffic Analysis":
-    #     show_congestion_page()
 
 
 def show_toll_booth_page():
@@ -307,11 +316,13 @@ def show_toll_booth_page():
                 message.write(
                     f"Real Time Stream for {st_data['last_object_clicked_popup']}"
                 )
-                message.write_stream(yield_data)
+                message2 = st.chat_message("user")
+                message2.write_stream(yield_data)
             else:
                 message = st.chat_message("assistant")
                 message.write(f"Real Time Stream for {list(MAPPER.keys())[0]}")
-                message.write_stream(yield_data)
+                message2 = st.chat_message("user")
+                message2.write_stream(yield_data)
 
 
 def show_congestion_page():
@@ -387,11 +398,13 @@ def show_congestion_page():
                 message.write(
                     f"Real Time Stream for {st_data['last_object_clicked_popup']}"
                 )
-                message.write_stream(simulate_vehicles)
+                message2 = st.chat_message("user")
+                message2.write_stream(simulate_vehicles)
             else:
                 message = st.chat_message("assistant")
                 message.write(f"Real Time Stream for {list(MAPPER.keys())[0]}")
-                message.write_stream(simulate_vehicles)
+                message2 = st.chat_message("user")
+                message2.write_stream(simulate_vehicles)
 
 
 if __name__ == "__main__":
