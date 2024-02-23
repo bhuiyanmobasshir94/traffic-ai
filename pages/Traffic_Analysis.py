@@ -393,23 +393,25 @@ def show_congestion_page():
 
     with col2:
         with st.container(height=735):
-            placeholder = st.empty()
+            placeholder2 = st.empty()
             if st_data["last_object_clicked_popup"]:
-                placeholder.empty()
+                placeholder2.empty()
                 st.session_state["T_VIDEO_URL"] = MAPPER[
                     st_data["last_object_clicked_popup"]
                 ]["video"]
                 cook_breakfast()
-                message = placeholder.chat_message("assistant")
-                message.write(
+                message2 = placeholder2.chat_message("assistant")
+                message2.write(
                     f"Real Time Stream for {st_data['last_object_clicked_popup']}"
                 )
-                message.write_stream(simulate_vehicles)
+                message2.write_stream(simulate_vehicles)
             else:
-                placeholder.empty()
-                message = placeholder.chat_message("assistant")
-                message.write(f"Real Time Stream for {list(MAPPER.keys())[0]}")
-                message.write_stream(simulate_vehicles)
+                placeholder2.empty()
+                time.sleep(1)
+                placeholder2.empty()
+                message2 = placeholder2.chat_message("assistant")
+                message2.write(f"Real Time Stream for {list(MAPPER.keys())[0]}")
+                message2.write_stream(simulate_vehicles)
 
 
 if __name__ == "__main__":
