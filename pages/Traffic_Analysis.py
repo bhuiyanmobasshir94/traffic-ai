@@ -164,6 +164,9 @@ def main():
         initial_sidebar_state="auto",
     )
     css = """
+        [data-testid="stSidebar"] {
+            width: 236px !important;
+        }
         [data-testid="toastContainer"] {
             position:absolute;
             top: 40px;
@@ -389,7 +392,7 @@ def show_congestion_page():
                     weight=10,
                 ).add_to(m)
 
-            st_data = st_folium(m, width=1050, height=240)
+            st_data = st_folium(m, width=1100, height=240)
 
     with col2:
         with st.container(height=735):
