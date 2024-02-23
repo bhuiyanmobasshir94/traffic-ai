@@ -325,6 +325,8 @@ def show_toll_booth_page():
                 message.write_stream(yield_data)
             else:
                 placeholder.empty()
+                time.sleep(1)
+                placeholder.empty()
                 message = placeholder.chat_message("assistant")
                 message.write(f"Real Time Stream for {list(MAPPER.keys())[0]}")
                 message.write_stream(yield_data)
