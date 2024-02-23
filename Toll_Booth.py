@@ -175,9 +175,6 @@ def main():
             padding-top: 60px;
             padding-bottom: 60px;
         }
-        [data-testid="stButton"] {
-            padding-top: 50px;
-        }
         [data-testid="stSidebarNav"] {
             position:absolute;
             bottom: 75%;
@@ -186,67 +183,11 @@ def main():
             display: none;
         }
         """
-
     st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
     # Sidebar menu
-    ms = st.session_state
-
-    if "themes" not in ms:
-        ms.themes = {
-            "current_theme": "light",
-            "refreshed": True,
-            "light": {
-                # "theme.base": "dark",
-                "theme.backgroundColor": "#f0f0f5",
-                "theme.primaryColor": "#6eb52f",
-                "theme.secondaryBackgroundColor": "#e0e0ef",
-                "theme.textColor": "#262730",
-                "theme.font": "sans serif",
-                "button_face": "🌜",
-            },
-            "dark": {
-                # "theme.base": "light",
-                "theme.backgroundColor": "#002b36",
-                "theme.primaryColor": "#d33682",
-                "theme.secondaryBackgroundColor": "#586e75",
-                "theme.textColor": "#fafafa",
-                "theme.font": "sans serif",
-                "button_face": "🌞",
-            },
-        }
-
-    def ChangeTheme():
-        previous_theme = ms.themes["current_theme"]
-        tdict = (
-            ms.themes["light"]
-            if ms.themes["current_theme"] == "light"
-            else ms.themes["dark"]
-        )
-        for vkey, vval in tdict.items():
-            if vkey.startswith("theme"):
-                st._config.set_option(vkey, vval)
-
-        ms.themes["refreshed"] = False
-        if previous_theme == "dark":
-            ms.themes["current_theme"] = "light"
-        elif previous_theme == "light":
-            ms.themes["current_theme"] = "dark"
-
-    btn_face = (
-        ms.themes["light"]["button_face"]
-        if ms.themes["current_theme"] == "light"
-        else ms.themes["dark"]["button_face"]
-    )
-
-    if ms.themes["refreshed"] == False:
-        ms.themes["refreshed"] = True
-        st.rerun()
-
     st.sidebar.image("logo.png", caption="Graaho Technologies", width=130)
     c1, c2, c3 = st.columns((2, 2, 2))
-    c1.button(btn_face, on_click=ChangeTheme)
     c2.title("Toll Booth")
-    # c3.button(btn_face, on_click=ChangeTheme)
     show_toll_booth_page()
 
 
