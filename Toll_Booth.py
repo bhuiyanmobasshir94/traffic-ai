@@ -246,7 +246,7 @@ def main():
 def show_toll_booth_page():
     MAPPER = {
         "Toll Plaza A": {"video": "https://www.youtube.com/embed/ckoAwzsCOxo"},
-        "Toll Plaza B": {"video": "https://www.youtube.com/embed/aTJVDGKHAHU"},
+        "Toll Plaza B": {"video": "https://www.youtube.com/embed/Nd_Ip6QLj7o"},
     }
 
     col1, col2 = st.columns([3, 1])
