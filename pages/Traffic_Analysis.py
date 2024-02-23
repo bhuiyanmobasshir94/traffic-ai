@@ -253,8 +253,8 @@ def show_toll_booth_page():
 
     with col1:
         with st.container(height=450):
-            if "VIDEO_URL" in st.session_state:
-                playlist_id = st.session_state["VIDEO_URL"].split("/")[-1]
+            if "T_VIDEO_URL" in st.session_state:
+                playlist_id = st.session_state["T_VIDEO_URL"].split("/")[-1]
                 url_style = """
                     <style>
                     .iframe-container {
@@ -274,7 +274,7 @@ def show_toll_booth_page():
                     """
                 url = f"""
                     <div class="iframe-container">
-                        <iframe src="{st.session_state["VIDEO_URL"]}?rel=0&amp;&amp;controls=0&amp;showinfo=0&amp;loop=1&autoplay=1&mute=1&playlist={playlist_id}" frameborder="0" allow="autoplay; encrypted-media" allowfullscreen></iframe>
+                        <iframe src="{st.session_state["T_VIDEO_URL"]}?rel=0&amp;&amp;controls=0&amp;showinfo=0&amp;loop=1&autoplay=1&mute=1&playlist={playlist_id}" frameborder="0" allow="autoplay; encrypted-media" allowfullscreen></iframe>
                     </div>
                     """
                 url = url_style + url
@@ -283,7 +283,7 @@ def show_toll_booth_page():
                     unsafe_allow_html=True,
                 )
             else:
-                st.session_state["VIDEO_URL"] = list(MAPPER.values())[0]["video"]
+                st.session_state["T_VIDEO_URL"] = list(MAPPER.values())[0]["video"]
 
         with st.container(height=270):
             m = folium.Map(
@@ -308,7 +308,7 @@ def show_toll_booth_page():
     with col2:
         with st.container(height=735):
             if st_data["last_object_clicked_popup"]:
-                st.session_state["VIDEO_URL"] = MAPPER[
+                st.session_state["T_VIDEO_URL"] = MAPPER[
                     st_data["last_object_clicked_popup"]
                 ]["video"]
                 cook_breakfast()
@@ -335,8 +335,8 @@ def show_congestion_page():
 
     with col1:
         with st.container(height=450):
-            if "VIDEO_URL" in st.session_state:
-                playlist_id = st.session_state["VIDEO_URL"].split("/")[-1]
+            if "T_VIDEO_URL" in st.session_state:
+                playlist_id = st.session_state["T_VIDEO_URL"].split("/")[-1]
                 url_style = """
                     <style>
                     .iframe-container {
@@ -356,7 +356,7 @@ def show_congestion_page():
                     """
                 url = f"""
                     <div class="iframe-container">
-                        <iframe src="{st.session_state["VIDEO_URL"]}?rel=0&amp;&amp;controls=0&amp;showinfo=0&amp;loop=1&autoplay=1&mute=1&playlist={playlist_id}" frameborder="0" allow="autoplay; encrypted-media" allowfullscreen></iframe>
+                        <iframe src="{st.session_state["T_VIDEO_URL"]}?rel=0&amp;&amp;controls=0&amp;showinfo=0&amp;loop=1&autoplay=1&mute=1&playlist={playlist_id}" frameborder="0" allow="autoplay; encrypted-media" allowfullscreen></iframe>
                     </div>
                     """
                 url = url_style + url
@@ -365,7 +365,7 @@ def show_congestion_page():
                     unsafe_allow_html=True,
                 )
             else:
-                st.session_state["VIDEO_URL"] = list(MAPPER.values())[0]["video"]
+                st.session_state["T_VIDEO_URL"] = list(MAPPER.values())[0]["video"]
 
         with st.container(height=270):
             m = folium.Map(
@@ -390,7 +390,7 @@ def show_congestion_page():
     with col2:
         with st.container(height=735):
             if st_data["last_object_clicked_popup"]:
-                st.session_state["VIDEO_URL"] = MAPPER[
+                st.session_state["T_VIDEO_URL"] = MAPPER[
                     st_data["last_object_clicked_popup"]
                 ]["video"]
                 cook_breakfast()
