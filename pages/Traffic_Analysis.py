@@ -164,6 +164,10 @@ def main():
         initial_sidebar_state="auto",
     )
     css = """
+        [data-testid="toastContainer"] {
+            position:absolute;
+            top: 40px;
+        }
         [data-testid="stAppViewBlockContainer"] {
             padding-top: 60px;
             padding-bottom: 60px;
@@ -389,22 +393,23 @@ def show_congestion_page():
 
     with col2:
         with st.container(height=735):
+            placeholder = st.empty()
             if st_data["last_object_clicked_popup"]:
+                placeholder.empty()
                 st.session_state["T_VIDEO_URL"] = MAPPER[
                     st_data["last_object_clicked_popup"]
                 ]["video"]
                 cook_breakfast()
-                message = st.chat_message("assistant")
+                message = placeholder.chat_message("assistant")
                 message.write(
                     f"Real Time Stream for {st_data['last_object_clicked_popup']}"
                 )
-                message2 = st.chat_message("user")
-                message2.write_stream(simulate_vehicles)
+                message.write_stream(simulate_vehicles)
             else:
-                message = st.chat_message("assistant")
+                placeholder.empty()
+                message = placeholder.chat_message("assistant")
                 message.write(f"Real Time Stream for {list(MAPPER.keys())[0]}")
-                message2 = st.chat_message("user")
-                message2.write_stream(simulate_vehicles)
+                message.write_stream(simulate_vehicles)
 
 
 if __name__ == "__main__":
