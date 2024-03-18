@@ -41,7 +41,6 @@ To meet the specific requirements of our project within the Bangladeshi context,
 By leveraging this comprehensive technological framework, our system achieves unparalleled accuracy and efficiency in traffic analysis, toll collection, and enforcement tasks. Through continuous refinement and adaptation, we remain committed to advancing the capabilities of our system to address the evolving challenges of traffic management in Bangladesh.
 
 By harnessing advanced technologies, our project revolutionizes traffic management and toll collection processes in Bangladesh. It promotes road safety, reduces congestion, optimizes resource utilization, and enhances overall transportation efficiency. With real-time insights and automated functionalities, our system empowers authorities to make informed decisions and uphold traffic regulations effectively.
-# -################################################
 
 ## Setup environment to run the project 
 #### Poetry to requirements.txt
