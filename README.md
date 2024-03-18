@@ -8,3 +8,7 @@ By harnessing advanced technologies, our project revolutionizes traffic manageme
 ```
 poetry export --without-hashes --format=requirements.txt > requirements.txt
 ```
+#### To run this project
+```
+streamlit run Toll_Booth.py --server.runOnSave true
+```
