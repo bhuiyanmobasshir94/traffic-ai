@@ -104,22 +104,42 @@ Run locally in this worktree:
 - `pytest` → **116 passed**, 1 warning (the expected `ByteTrack` `FutureWarning` from the
   pinned `supervision` version).
 - `ruff check .` → All checks passed.
-- `ruff format --check .` → 63 files already formatted.
+- `ruff format --check .` → 64 files already formatted.
 - `docker compose config -q` → exit 0, against a temporary `.env`.
 - Router priority confirmed in rendered compose output: worker `priority: "100"`,
   ui `priority: "1"`.
 
-**Not verified — stated plainly:**
+**Both images built and run (arm64 host):**
 
-- **No container image was built and the stack was never started.** `docker build` and
-  `docker compose up` were not run. Base-image and layer choices are reasoned, not
-  build-verified.
-- **The app was never launched and looked at.** No screenshot, no browser session.
-- **Real inference was never executed.** `torch`/`ultralytics` are deliberately not
-  installed here; every test runs against `StubDetector`. The `UltralyticsDetector` path
-  has never run in this session.
-- The demo videos were not downloaded (the two URLs were confirmed to return HTTP 200 with
-  `video/mp4` and the expected byte counts, but no file was fetched or decoded).
+- `docker build -f docker/Dockerfile.ui` → exit 0, 604MB. Verified it contains no torch —
+  the extras split does what it is for.
+- UI container started; `GET /_stcore/health` → **200 after 2s**.
+- `docker build -f docker/Dockerfile.worker` → exit 0, 2.01GB.
+- Worker container started against a real Redis. `GET /api/healthz` → **200 after ~25s**
+  (first start downloads `yolov8n.pt`). `GET /api/cameras` returned the real registry.
+- **Real ultralytics loaded and fetched YOLOv8 weights inside the container** — the
+  inference stack is not merely declared, it initialises.
+- **`GET /api/readyz` → 503** with `cameras_running: 0, cameras_total: 2` while no video
+  files were present. Correct, and it exercises the readiness fix made during integration.
+- **Failure path confirmed:** both pipelines logged
+  `pipeline_error ... 'could not open video: /data/videos/toll-plaza-a.mp4'` and **the API
+  stayed up and kept serving**. This is the "`run()` never raises out" requirement holding
+  under a real fault, not just in a test.
+
+**Still not verified — stated plainly:**
+
+- **The full stack was never brought up together.** `docker compose up` was not run; the
+  two containers were exercised individually. Traefik, TLS issuance, and the UI↔worker HTTP
+  path have not been observed end to end.
+- **The dashboard was never opened in a browser.** No screenshot. Nobody has seen a vehicle
+  counted.
+- **Inference never ran over actual video.** Weights loaded, but no frame was decoded or
+  detected on — the demo videos were not downloaded (URLs confirmed HTTP 200 `video/mp4`
+  with expected byte counts; no file fetched).
+- **Images were built on arm64.** A typical Linux server is amd64, where Compose will build
+  fresh. The Dockerfile logic is verified; that exact artifact is not.
+- The `YOLO_CONFIG_DIR` fix and the lockfile removal landed *after* these builds, so the
+  current Dockerfiles differ slightly from the images measured above.
 
 ## Critical notes
 

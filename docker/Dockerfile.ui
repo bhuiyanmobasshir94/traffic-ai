@@ -20,9 +20,9 @@ ENV PATH="/opt/venv/bin:${PATH}"
 # poetry-core's build backend only needs `src/traffic_ai` to exist to
 # resolve metadata, not to contain real code — so a stub package is enough
 # to install the `ui` extra's third-party dependencies here, in a layer
-# that Docker only invalidates when pyproject.toml/poetry.lock change, not
-# on every source edit.
-COPY pyproject.toml poetry.lock README.md ./
+# that Docker only invalidates when pyproject.toml changes, not on every
+# source edit.
+COPY pyproject.toml README.md ./
 RUN mkdir -p src/traffic_ai \
     && touch src/traffic_ai/__init__.py \
     && pip install --upgrade pip \

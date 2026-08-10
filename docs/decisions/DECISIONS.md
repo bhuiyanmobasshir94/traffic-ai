@@ -178,3 +178,25 @@ half-working stage would misrepresent capability in front of a client.
 
 **Rules out.** Any placeholder, sample, or "representative" plate value in code, fixtures, or
 UI. `None` means not read — never unreadable, never a stand-in.
+
+---
+
+## 2026-08-10 — No lockfile; dependencies resolve from `pyproject.toml`
+
+**Decision.** Deleted `poetry.lock` and `requirements.txt`. Docker images, CI, and
+`make install` all resolve with `pip` from `pyproject.toml` and its `ui` / `worker` extras.
+
+**Why.** The committed lock described the February 2024 dependency set and would have made
+`poetry install` fail outright. Regenerating it was attempted and abandoned after ~29
+minutes: Poetry 1.6 resolving torch's graph did not converge. The images never used the
+lock for resolution — they `pip install ".[extra]"` — and with the extras split, one lock
+serving two differently-shaped images buys little. `requirements.txt` was referenced by
+nothing and pinned `streamlit==1.31.1`, so installing from it would have silently rebuilt
+the old world.
+
+**Rules out.** Byte-reproducible installs. Version floors are caret constraints in
+`pyproject.toml`, so a fresh install can pick up a new minor release. This is the real cost
+of the decision and it is accepted for a demo, not endorsed for anything load-bearing.
+Restoring reproducibility means generating a lock on a machine where resolution completes
+(a newer Poetry, or `uv lock`) and re-adding it to the image build context — a good
+follow-up, not a blocker.

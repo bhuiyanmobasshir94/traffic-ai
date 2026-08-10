@@ -8,22 +8,24 @@ help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
 
-install: ## Install project dependencies with Poetry
-	poetry install
+install: ## Install the project (both extras) plus dev tooling, with pip
+	python -m pip install --upgrade pip
+	pip install -e ".[ui,worker]"
+	pip install pytest pytest-asyncio ruff fakeredis pyyaml
 
 videos: ## Download demo footage into data/videos/ (~65MB)
-	poetry run python scripts/fetch_demo_videos.py
+	python scripts/fetch_demo_videos.py
 
 test: ## Run the test suite
-	poetry run pytest
+	pytest
 
 lint: ## Check formatting and lint rules (no changes made)
-	poetry run ruff check .
-	poetry run ruff format --check .
+	ruff check .
+	ruff format --check .
 
 fmt: ## Auto-fix lint issues and reformat
-	poetry run ruff check --fix .
-	poetry run ruff format .
+	ruff check --fix .
+	ruff format .
 
 up: ## Build images if needed and start the stack in the background
 	$(COMPOSE) up -d --build
