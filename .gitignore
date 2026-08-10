@@ -166,3 +166,9 @@ cython_debug/
 
 # Streamlit secrets — must never be committed
 .streamlit/secrets.toml
+
+# Deployment — demo footage is fetched by scripts/fetch_demo_videos.py, not
+# committed; the venv and Let's Encrypt certificate storage are host-local.
+data/videos/*.mp4
+.venv/
+letsencrypt/

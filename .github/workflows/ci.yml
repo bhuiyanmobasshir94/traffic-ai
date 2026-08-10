@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry
+        run: pipx install poetry
+
+      # Dev group (pytest, ruff, fakeredis) + the `ui` extra only. The
+      # `worker` extra pulls ultralytics, which pulls torch — this suite is
+      # designed to run without either, per tests/conftest.py.
+      - name: Install dependencies
+        run: poetry install --extras ui
+
+      - name: Lint
+        run: |
+          poetry run ruff check .
+          poetry run ruff format --check .
+
+      - name: Test
+        run: poetry run pytest
+
+  compose-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate compose.yaml
+        run: |
+          cp .env.example .env
+          docker compose config -q

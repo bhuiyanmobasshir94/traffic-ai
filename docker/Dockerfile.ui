@@ -1,0 +1,64 @@
+# syntax=docker/dockerfile:1
+#
+# UI image — the Streamlit dashboard only. Installs the `ui` extra
+# exclusively (see pyproject.toml [tool.poetry.extras]); it must never pull
+# in torch, ultralytics, or opencv. That split is the entire point of the
+# extras — keep it that way.
+
+FROM python:3.12-slim-bookworm AS builder
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /build
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+
+# --- dependency layer -------------------------------------------------
+# poetry-core's build backend only needs `src/traffic_ai` to exist to
+# resolve metadata, not to contain real code — so a stub package is enough
+# to install the `ui` extra's third-party dependencies here, in a layer
+# that Docker only invalidates when pyproject.toml/poetry.lock change, not
+# on every source edit.
+COPY pyproject.toml poetry.lock README.md ./
+RUN mkdir -p src/traffic_ai \
+    && touch src/traffic_ai/__init__.py \
+    && pip install --upgrade pip \
+    && pip install ".[ui]"
+
+# --- source layer -------------------------------------------------------
+# Real source replaces the stub. --force-reinstall is required: pip
+# otherwise sees the same package name/version already installed and skips
+# it as "already satisfied".
+COPY src ./src
+RUN pip install --no-deps --force-reinstall .
+
+FROM python:3.12-slim-bookworm AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PATH="/opt/venv/bin:${PATH}" \
+    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+
+RUN groupadd --system --gid 1000 app \
+    && useradd --system --uid 1000 --gid app --create-home --home-dir /app \
+        --shell /usr/sbin/nologin app
+
+COPY --from=builder /opt/venv /opt/venv
+
+WORKDIR /app
+COPY --chown=app:app Toll_Booth.py ./
+COPY --chown=app:app pages ./pages
+COPY --chown=app:app logo.png ./
+COPY --chown=app:app .streamlit ./.streamlit
+
+USER app
+
+EXPOSE 8501
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request as u,sys; sys.exit(0 if u.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=3).status == 200 else 1)"
+
+ENTRYPOINT ["streamlit", "run", "Toll_Booth.py", \
+    "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true"]

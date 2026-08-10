@@ -1,19 +1,19 @@
 # CLAUDE.md — traffic-ai
 
-A Streamlit dashboard for highway toll-booth monitoring and traffic congestion analysis in
-Dhaka, built as a Graaho client-facing demo. **What is committed here is a simulation, not a
-system.** Every number plate, vehicle count, and congestion flag comes from `random.choice()`;
-the "camera feeds" are autoplaying YouTube iframes. There is no computer vision, no inference,
-no database, no authentication, and no persistence anywhere in this repository.
+Toll-booth and traffic-congestion monitoring for Dhaka, built as a Graaho client-facing
+demo. Vehicles are detected, tracked, and counted for real: a worker decodes demo footage,
+runs a YOLO detector and a ByteTrack tracker over it, counts line crossings by direction,
+and publishes state and annotated frames. Streamlit is a thin viewer over that state.
 
-The README describes YOLOv8, DeepSORT, OCR, and "models fine-tuned on Bangladeshi vehicle
-datasets." **None of that exists in this codebase** — there is no `ultralytics`, `opencv`,
-`torch`, or OCR dependency in `pyproject.toml` or `requirements.txt`. Treat the README as a
-product pitch, not a description of the code. Do not go looking for a detector.
+**The numbers on the dashboard are measured, not generated.** Until 2026-08-10 they were
+`random.choice()` and the README described a system that did not exist. That is no longer
+true, and it must not become true again: nothing in this repository may present a
+fabricated value as a measurement. The one deliberate gap is number-plate reading — see
+the ANPR note under Non-negotiables.
 
-This repo is the base for the real build: replacing the simulation with actual camera ingest
-and inference. That transition is the point of most work here, so weigh changes by whether
-they make it easier or harder.
+It is still a demo. No user depends on it, no money moves, and it stores nothing. But it
+now processes video and runs a real pipeline, so a bug can burn CPU, wedge a container, or
+put a wrong number in front of a client.
 
 Detailed standards live in `.claude/rules/` and load when you touch the paths they cover:
 
@@ -23,68 +23,78 @@ Detailed standards live in `.claude/rules/` and load when you touch the paths th
 
 ## Operating constraints
 
-- **Streamlit reruns the whole script on every interaction.** There is no event loop and no
-  partial update. Any widget click restarts the page script from line 1 and all counters
-  reset. Anything that must survive an interaction lives in `st.session_state`.
-- **The current data generators block the script thread.** `yield_data()` and
-  `simulate_vehicles()` (`Toll_Booth.py:113`, `:128`) sleep in-loop feeding `st.write_stream`,
-  500 iterations at 3s and 2s — roughly 25 and 17 minutes of frozen UI. Real ingest must not
-  follow this pattern: it runs off the script thread, and the UI reads the latest result
-  rather than driving the loop.
-- **The UI is pinned to Streamlit internals.** Layout depends on hardcoded pixel heights
-  (`st.container(height=450|270|735)`) and CSS targeting unversioned test IDs —
-  `stSidebarNav`, `stAppViewBlockContainer`, `toastContainer` (`Toll_Booth.py:166-186`). Pins
-  are frozen at `streamlit==1.31.1` (Feb 2024). A dependency upgrade is a UI rewrite, not a
-  version bump; treat it as its own task with a visual check.
-- **There is nowhere safe to put a secret yet.** `.gitignore` covers `.env` but not
-  `.streamlit/secrets.toml`. Before the first camera credential, RTSP URL, or API key lands,
-  that file must be gitignored. Assume anything added carelessly gets committed.
-- **Nothing here is load-bearing today.** No user depends on it, no money moves, no personal
-  data is stored. A bug is a broken demo, not an incident. That changes the moment real feeds
-  arrive — a photographed number plate is personal data, and the risk profile in this file
-  must be revised at that point rather than inherited.
+- **Three services, one contract.** `worker` (inference + FastAPI) and `ui` (Streamlit)
+  share only `src/traffic_ai/domain.py`. Changing a field there is an API change and both
+  sides move together. The UI never imports the worker; it talks HTTP.
+- **Video decode is blocking and must stay off the event loop.** `cv2.VideoCapture.read()`
+  runs via `asyncio.to_thread` in `worker/pipeline.py`. The whole rewrite exists because the
+  old code slept on the script thread; never reintroduce `time.sleep` in a serving path.
+- **Redis is a cache with a TTL, not a database.** Every key expires
+  (`state_ttl_seconds`, default 30). Persistence is off. Counters reset when the worker
+  restarts — by design, so a dead worker cannot leave a dashboard that looks live. The UI
+  distinguishes live / stale / no-data and must keep doing so.
+- **`ultralytics` is AGPL-3.0 and this repo is MIT.** Detection sits behind the `Detector`
+  Protocol in `worker/detection.py`, imported inside `UltralyticsDetector.__init__` and
+  never at module scope. Do not call `ultralytics` from pipeline, API, or UI code. Whether
+  to ship it at all is a live question for the maintainer, not a settled decision.
+- **`supervision` is pinned `>=0.30,<0.31`.** Its `ByteTrack` export is deprecated and
+  scheduled for removal in 0.31. `worker/tracking.py` imports the canonical module path and
+  wraps it in `VehicleTracker`, so the eventual swap is one file. The `FutureWarning` the
+  suite emits comes from the library's own constructor and is expected.
+- **Inference is CPU-bound and the server is small.** Two streams at `target_fps=12` with
+  `detect_every_n_frames=2`. If the demo is sluggish, tune those and `frame_width` before
+  changing anything structural — `docs/DEPLOYMENT.md` says which knob does what.
+- **The stack is one domain.** Traefik routes `${DOMAIN}/` to the UI and `${DOMAIN}/api` to
+  the worker, with an explicit router priority so `/api` wins. One DNS record, one
+  certificate, no CORS. Moving the API to its own hostname means revisiting `api_public_url`
+  and the CORS posture.
 
 ### What a new engineer gets wrong in the first week
 
-- **Editing the page function that never runs.** Both live files define *both* page
-  functions but call only one: `Toll_Booth.py:191` calls `show_toll_booth_page()`, leaving
-  `show_congestion_page()` at `:279` dead; `pages/Traffic_Analysis.py:191` calls
-  `show_congestion_page()`, leaving `show_toll_booth_page()` at `:194` dead. The dead copies
-  have already diverged. Check what `main()` calls before editing.
-- **Touching `Starter.py`.** It is the orphaned pre-multipage version — nothing imports or
-  runs it. Its name makes it look like the entrypoint; the entrypoint is `Toll_Booth.py`.
-- **Running from the wrong directory.** `logo.png` loads by relative path; the app only
-  starts from the repository root.
-- **Trying to debug the detector.** There is no detector.
+- **Assuming the README is current.** It was aspirational marketing for two years. It has
+  been rewritten against the code, but check `git log` before trusting any claim in it.
+- **Adding a fabricated value "just for the demo."** A placeholder plate, a sample count, a
+  seeded random. This is the specific failure the rewrite exists to fix.
+- **Editing `pyproject.toml` extras carelessly.** `ui` and `worker` are separate on purpose:
+  the UI image must never pull torch. Adding a shared dependency to the wrong place quietly
+  doubles the image.
+- **Running the suite expecting inference.** `ultralytics`/`torch` are deliberately not a
+  test dependency. Detection is stubbed (`StubDetector`); tests marked
+  `requires_inference` skip unless the stack is importable.
 
 ## Non-negotiables
 
-- **No plaintext secrets** in code, configuration, or committed files — and
-  `.streamlit/secrets.toml` stays gitignored.
-- **Guard lookups on user-driven values.** `MAPPER[st_data["last_object_clicked_popup"]]`
-  (`Toll_Booth.py:261`) is truthiness-checked but not membership-checked; a new marker or a
-  renamed popup raises `KeyError`. New lookups on click payloads use `.get()` with a fallback.
-- **Nothing user-controlled reaches `unsafe_allow_html=True`.** The iframe blocks build HTML
-  by string concatenation. The URLs are constants today; the moment one comes from input,
-  config, or an API, it is an injection vector.
-- **Do not add a sixth copy.** The map-render block already appears five times and the iframe
-  HTML six. Extract to a shared module before duplicating again.
-- **Verify by running the app.** There are no tests, no linter, and no CI in this repo. A
-  claim that something works means it was launched and looked at, and the report says so.
-  Never claim a check you did not run — there is no suite to hide behind.
+- **No fabricated data.** No random, placeholder, or "representative" value may reach the
+  UI or the API as though it were measured.
+- **No plate is ever invented.** `CrossingEvent.plate_text` is `None` unless a real model
+  read it; `None` means not read, never unreadable and never a stand-in.
+  `build_plate_reader` raises when ANPR is enabled without a model — it fails closed rather
+  than falling back. No plate model ships with this project.
+- **No plaintext secrets.** `.env` and `.streamlit/secrets.toml` are gitignored. Only
+  `.env.example` is tracked, and it carries no values for `DOMAIN` or `ACME_EMAIL`.
+- **`camera_id` is an allowlist boundary.** It arrives from map clicks and URLs. Resolve it
+  through `cameras.get_camera()`, which returns `None`; a miss is a 404, never an
+  interpolation into a Redis key or a path.
+- **Nothing user- or config-derived reaches `unsafe_allow_html` unescaped.** The one
+  markup builder is `ui/components.py::_build_stream_markup` — allowlist first, then
+  `html.escape`. Keep it the only one.
+- **Redis and the worker are never published to the host.** Only Traefik binds ports.
+- **Fail visibly.** `CameraPipeline.run()` never raises out: it records the fault on
+  `CameraState.error` and keeps publishing so the UI can show it. No bare `except: pass`
+  anywhere.
 
 ## Orchestration in this repository
 
 Global roles are defined in `~/.claude/CLAUDE.md`. Repo-specific routing:
 
-- **Always dispatch `reviewer` before integrating** any change introducing real camera
-  ingest, credential handling, or plate/image storage. The first code that touches real
-  vehicle data is the first code here with a genuine blast radius.
-- **Route to `implementer`, not `fast-implementer`,** for anything touching the duplicated
-  page functions. A "mechanical" edit there lands in the dead copy.
-- **Do not parallelize across** `Toll_Booth.py`, `pages/Traffic_Analysis.py`, and
-  `Starter.py`. Their first 155 lines are byte-identical; concurrent workers produce
-  divergent copies of the same helper.
+- **Always dispatch `reviewer` before integrating** changes to `worker/pipeline.py`,
+  `worker/anpr.py`, credential handling, or anything that would store a frame or a plate.
+  Real vehicle imagery is personal data; this repo does not store any today, and the risk
+  profile in this file must be rewritten before it does.
+- **Route to `implementer`, not `fast-implementer`,** for `domain.py` — it is the contract
+  between two services, so a "mechanical" edit there is a two-sided API change.
+- **Do not parallelize across** `domain.py`, `config.py`, and `cameras.py`. Everything
+  depends on them; concurrent edits produce a contract that no slice agrees on.
 
 ## Session changelog
 
@@ -94,27 +104,41 @@ Every session that changes code, configuration, or documentation writes an entry
 ## Commands
 
 ```bash
-# Install
-poetry install
+# Install (core + both extras + dev tooling)
+poetry install --extras "ui worker"
 
-# Run — must be from the repository root
-streamlit run Toll_Booth.py --server.runOnSave true
+# Fetch the demo footage (~65MB, MD5-verified). Required before first run.
+make videos
 
-# Regenerate requirements.txt after a dependency change
-poetry export --without-hashes --format=requirements.txt > requirements.txt
+# Verify
+pytest                      # full suite; no torch required
+ruff check . && ruff format --check .
+
+# Run the whole stack locally (needs .env — copy .env.example)
+docker compose up --build
+
+# Run one service against a local Redis
+python -m traffic_ai.api                             # worker on :8000
+streamlit run Toll_Booth.py                          # UI on :8501
 ```
 
-No test, lint, format, or migration command exists in this project. Do not invent one, and do
-not report one as run.
+Deployment is `docs/DEPLOYMENT.md`. Do not invent commands that are not in these two places.
 
 ## Architecture
 
-`Toll_Booth.py` is the entrypoint; Streamlit's `pages/` convention auto-registers
-`pages/Traffic_Analysis.py` as the second nav entry. Each page renders the same three regions:
-a video container holding a YouTube iframe, a Folium map with two toll-plaza markers and three
-congestion polylines, and a right-hand chat column streaming generated telemetry. Clicking a
-marker returns its popup text through `st_folium`, which maps to a video URL held in
-`st.session_state` — `VIDEO_URL` on the toll page, `T_VIDEO_URL` on the analysis page, so the
-two do not clobber each other. There is no shared module: coordinates, helpers, and generators
-are copy-pasted identically into all three Python files. Clearing that is the main structural
-debt before real ingest lands.
+`worker/pipeline.py` owns one `CameraPipeline` per camera: decode a frame, detect every
+Nth frame, track on every frame, count crossings against a normalized line, derive
+congestion from measured flow and density, annotate, publish. It writes `CameraState`,
+a JPEG, and `CrossingEvent`s to Redis through `store.py`, all TTL'd.
+
+`api/` serves that state — JSON, a single frame, and an MJPEG stream — and owns pipeline
+startup and shutdown in its lifespan. It imports the worker lazily so the API module can be
+loaded, and tested, without the inference stack.
+
+`ui/` reads the API over HTTP. `dashboard.py` renders one layout used by both pages;
+`Toll_Booth.py` and `pages/Traffic_Analysis.py` are ~25-line entrypoints that pick a camera.
+Live regions refresh via `@st.fragment(run_every="2s")`; the MJPEG `<img>` sits outside the
+fragment so the browser streams it directly and Streamlit never handles a frame.
+
+`cameras.py` is the single registry of cameras and map geometry — coordinates live there
+once, as `[lat, lon]`.
