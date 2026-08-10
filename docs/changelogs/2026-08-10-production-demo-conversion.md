@@ -126,20 +126,45 @@ Run locally in this worktree:
   stayed up and kept serving**. This is the "`run()` never raises out" requirement holding
   under a real fault, not just in a test.
 
+**Real inference over real footage — observed:**
+
+Demo videos downloaded (MD5-verified), then redis + worker + ui run together on a Docker
+network. Over 45 seconds on `toll-plaza-a`:
+
+- Counts advanced `incoming car 1 → 3`, `outgoing car 1 → 2`; `frames_processed` 32 → 346.
+- Crossing events carried real track ids and detection confidences (0.49–0.86).
+- `congestion` derived as `free_flow` from measured throughput (`throughput_per_min` 2.0 →
+  5.0), not hardcoded.
+- `GET /api/cameras/toll-plaza-a/frame.jpg` → 200, `image/jpeg`, 75,593 bytes.
+- `GET /api/readyz` → 200, `cameras_running: 2, cameras_total: 2`.
+- UI container healthy alongside it (`/_stcore/health` → 200).
+- **`plate_text` was `null` on every event** — the only value that appeared. The
+  no-fabrication rule holds at runtime, not just in tests.
+
+**This run found a bug that nothing else did.** On the first attempt `toll-plaza-b` failed
+continuously with `operator torchvision::nms does not exist` and readiness reported
+`cameras_running: 1` of 2. Cause: `docker/Dockerfile.worker` installed `torch` from the
+PyTorch CPU wheel index but let `torchvision` resolve from the default index, producing a
+mismatched pair. The failure mode is quiet — torchvision imports fine, the container
+starts, the healthcheck passes, and it only breaks when a detection needs non-maximum
+suppression. Two clean image builds, a green healthcheck, and 116 passing tests all
+coexisted with a half-dead detector. Fixed by installing both from the same index in one
+command; re-running the identical test gave `cameras_running: 2` with zero `pipeline_error`
+and zero NMS errors.
+
 **Still not verified — stated plainly:**
 
-- **The full stack was never brought up together.** `docker compose up` was not run; the
-  two containers were exercised individually. Traefik, TLS issuance, and the UI↔worker HTTP
-  path have not been observed end to end.
-- **The dashboard was never opened in a browser.** No screenshot. Nobody has seen a vehicle
-  counted.
-- **Inference never ran over actual video.** Weights loaded, but no frame was decoded or
-  detected on — the demo videos were not downloaded (URLs confirmed HTTP 200 `video/mp4`
-  with expected byte counts; no file fetched).
-- **Images were built on arm64.** A typical Linux server is amd64, where Compose will build
-  fresh. The Dockerfile logic is verified; that exact artifact is not.
-- The `YOLO_CONFIG_DIR` fix and the lockfile removal landed *after* these builds, so the
-  current Dockerfiles differ slightly from the images measured above.
+- **`docker compose up` was never run.** Services were exercised individually on a Docker
+  network. **Traefik and TLS issuance have not been observed at all** — the routing rules
+  and ACME config are validated only by `docker compose config`.
+- **The dashboard was never opened in a browser.** The UI container is healthy and the API
+  serves it, but no human or automated client has rendered the page, so the map, fragment
+  refresh, and MJPEG `<img>` are unobserved in a real browser.
+- **Images were built on arm64.** A typical Linux server is amd64, where Compose builds
+  fresh. The Dockerfile logic is verified; that exact artifact is not, and the torchvision
+  pairing above is precisely the class of thing that can differ per platform.
+- Only `toll-plaza-a` was inspected in detail; `toll-plaza-b` was confirmed running via the
+  readiness count, not by reading its counters.
 
 ## Critical notes
 
