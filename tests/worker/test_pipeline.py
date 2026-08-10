@@ -125,7 +125,16 @@ async def test_run_never_raises_and_recovers_to_stopped(
     )
 
     task = asyncio.create_task(pipe.run())
-    await asyncio.sleep(0.05)  # let at least one failed attempt publish an error state
+
+    # Poll for the first failed attempt rather than sleeping a fixed interval.
+    # A fixed sleep races the pipeline's first decode attempt and fails
+    # intermittently on a loaded machine — the assertion below then reports a
+    # timing artifact as a logic error.
+    async def _wait_for_error() -> None:
+        while pipe.state.status is not PipelineStatus.ERROR:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_wait_for_error(), timeout=5.0)
 
     assert pipe.state.status is PipelineStatus.ERROR
     assert pipe.state.error is not None

@@ -152,14 +152,43 @@ coexisted with a half-dead detector. Fixed by installing both from the same inde
 command; re-running the identical test gave `cameras_running: 2` with zero `pipeline_error`
 and zero NMS errors.
 
+**Full stack through Traefik — observed.**
+
+`docker compose up -d` against the unmodified `compose.yaml`, `DOMAIN=traffic.localhost`.
+All four services reached healthy. ACME could not issue for a non-public domain, so Traefik
+served its self-signed fallback and routing was exercised over that:
+
+- `GET /api/healthz` → 200 returning the worker's JSON (`environment: production`), while
+  `GET /` → 200 returning Streamlit's HTML. **Router priority proven at the content level**,
+  not just in rendered config: `/api` reaches the worker, everything else the UI.
+- `/api/readyz`, `/api/cameras`, `/_stcore/health`, `/Traffic_Analysis` → all 200.
+- **WebSocket upgrade works:** `/_stcore/stream` → `HTTP/1.1 101 Switching Protocols`. This
+  was the flagged reverse-proxy risk; it is now measured rather than assumed.
+- **MJPEG through the proxy:** 1,927,434 bytes in 8s, `multipart/x-mixed-replace;
+  boundary=frame`, with the request-id middleware populating `X-Request-Id`.
+
+**Dashboard rendered in a real browser.** Chrome's self-signed interstitial cannot be
+driven by automation, so the page itself was loaded over plain HTTP against the same
+compose network. Observed live: the annotated MJPEG with tracked boxes labelled `#9 bus`,
+`#1 car`, `#2 car`; the counting line; the status overlay
+(`Toll Plaza A | running | Free Flow | 11.0/min | tracks=5`); the Dhaka map with corridors
+coloured from live congestion; a `Live — updated 1s ago` banner; and the events table with
+real timestamps, classes (car and truck), directions, and confidences 36–87%.
+**Every `plate` cell rendered `—`** — the no-fabrication rule visible in the product.
+
+Two findings came out of this and are recorded in `docs/DEPLOYMENT.md`:
+
+1. **Let's Encrypt rejects reserved contact domains.** `ACME_EMAIL=…@example.com` fails
+   account registration outright (`invalidContact … forbidden domain "example.com"`) before
+   any challenge runs — it looks like a DNS or firewall failure but is not.
+2. **`curl` must be forced to `--http1.1` to test the WebSocket upgrade.** Over HTTP/2 the
+   upgrade headers are ignored and the response is a misleading `200`.
+
 **Still not verified — stated plainly:**
 
-- **`docker compose up` was never run.** Services were exercised individually on a Docker
-  network. **Traefik and TLS issuance have not been observed at all** — the routing rules
-  and ACME config are validated only by `docker compose config`.
-- **The dashboard was never opened in a browser.** The UI container is healthy and the API
-  serves it, but no human or automated client has rendered the page, so the map, fragment
-  refresh, and MJPEG `<img>` are unobserved in a real browser.
+- **Real TLS certificate issuance.** ACME requires a public DNS record; only the
+  self-signed fallback path was exercised. The HTTP-01 wiring is configured and *attempted*
+  (the failure above proves the resolver is live), but no certificate has been issued.
 - **Images were built on arm64.** A typical Linux server is amd64, where Compose builds
   fresh. The Dockerfile logic is verified; that exact artifact is not, and the torchvision
   pairing above is precisely the class of thing that can differ per platform.

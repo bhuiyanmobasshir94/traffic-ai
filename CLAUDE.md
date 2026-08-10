@@ -34,9 +34,11 @@ Detailed standards live in `.claude/rules/` and load when you touch the paths th
   restarts — by design, so a dead worker cannot leave a dashboard that looks live. The UI
   distinguishes live / stale / no-data and must keep doing so.
 - **`ultralytics` is AGPL-3.0 and this repo is MIT.** Detection sits behind the `Detector`
-  Protocol in `worker/detection.py`, imported inside `UltralyticsDetector.__init__` and
-  never at module scope. Do not call `ultralytics` from pipeline, API, or UI code. Whether
-  to ship it at all is a live question for the maintainer, not a settled decision.
+  Protocol in `worker/detection.py`. `Settings.detector` (`TRAFFIC_AI_DETECTOR`) defaults
+  to `"torchvision"` (BSD-3-Clause, `TorchvisionDetector`), so the default deployment path
+  carries no AGPL obligation; `"ultralytics"` (`UltralyticsDetector`) is a fully supported
+  explicit opt-in. Both import their library inside `__init__`, never at module scope. Do
+  not call `torch`, `torchvision`, or `ultralytics` from pipeline, API, or UI code.
 - **`supervision` is pinned `>=0.30,<0.31`.** Its `ByteTrack` export is deprecated and
   scheduled for removal in 0.31. `worker/tracking.py` imports the canonical module path and
   wraps it in `VehicleTracker`, so the eventual swap is one file. The `FutureWarning` the

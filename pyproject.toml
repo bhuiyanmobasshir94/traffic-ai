@@ -27,6 +27,11 @@ streamlit-folium = { version = "^0.27", optional = true }
 
 fastapi = { version = "^0.141", optional = true }
 uvicorn = { version = "^0.52", extras = ["standard"], optional = true }
+# torchvision is the DEFAULT detector (BSD-3-Clause) — see Settings.detector.
+# It must be installed from the same index as torch or its compiled ops fail at
+# inference with "operator torchvision::nms does not exist"; docker/Dockerfile.worker
+# installs both from the PyTorch CPU index in one command.
+torchvision = { version = "^0.20", optional = true }
 ultralytics = { version = "^8.4", optional = true }
 # Pinned below 0.31: supervision schedules the removal of its ByteTrack export
 # there. We import the canonical module path behind our own tracker interface
@@ -42,6 +47,7 @@ ui = ["streamlit", "folium", "streamlit-folium"]
 worker = [
     "fastapi",
     "uvicorn",
+    "torchvision",
     "ultralytics",
     "supervision",
     "opencv-python-headless",

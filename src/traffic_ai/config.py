@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     video_dir: Path = Path("data/videos")
 
     # --- inference --------------------------------------------------------
+    # `torchvision` (BSD-3-Clause) is the default so the default deployment
+    # carries no AGPL obligation. `ultralytics` (AGPL-3.0) stays fully
+    # supported as an explicit opt-in — see the Licensing note in README.md.
+    detector: Literal["torchvision", "ultralytics"] = "torchvision"
     model_weights: str = "yolov8n.pt"
     device: str = "cpu"
     confidence_threshold: float = Field(default=0.35, ge=0.0, le=1.0)

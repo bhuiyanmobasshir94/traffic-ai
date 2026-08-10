@@ -200,3 +200,69 @@ of the decision and it is accepted for a demo, not endorsed for anything load-be
 Restoring reproducibility means generating a lock on a machine where resolution completes
 (a newer Poetry, or `uv lock`) and re-adding it to the image build context — a good
 follow-up, not a blocker.
+
+---
+
+## 2026-08-10 — torchvision is the default detector; ultralytics becomes an explicit opt-in
+
+**Decision.** Added `TorchvisionDetector` (`src/traffic_ai/worker/detection.py`), backed by
+`torchvision.models.detection.fasterrcnn_mobilenet_v3_large_fpn` with its bundled
+COCO-pretrained weights. `Settings.detector` (`TRAFFIC_AI_DETECTOR`) selects the backend and
+defaults to `"torchvision"`; `"ultralytics"` remains fully supported, selecting
+`UltralyticsDetector` as before. `build_detector` falls back to `StubDetector` with a loud
+warning for either value if that backend's library is not importable. This supersedes half
+of "Detection sits behind an interface because ultralytics is AGPL-3.0" above: the interface
+was built so a swap would be a one-file change, and this is that swap, landing as a default
+rather than a replacement — `ultralytics` was not removed.
+
+**Why.** `torchvision` is BSD-3-Clause; `ultralytics` (YOLOv8) is AGPL-3.0 and this
+repository is MIT, served over a network, which is exactly what the AGPL's network-use
+clause reaches. Making the permissive detector the default means the default deployment
+path carries no AGPL obligation, closing the "Open" item left by the interface decision.
+
+Model choice within `torchvision.models.detection` was empirical, not assumed. Benchmarked
+`ssdlite320_mobilenet_v3_large` and `fasterrcnn_mobilenet_v3_large_fpn` against
+`data/videos/toll-plaza-a.mp4` inside `traffic-ai-worker:test` (CPU, `torch.set_num_threads(1)`,
+10 frames sampled across the clip): ssdlite averaged ~0.6-1.2s/frame versus fasterrcnn's
+~1.4-4.5s/frame (both single-threaded; absolute numbers varied run to run under host load,
+the relative gap — fasterrcnn roughly 3-5x slower — held throughout), but ssdlite scored
+real vehicles in this footage at ~0.2-0.3 confidence, almost never clearing the default 0.35
+threshold, while fasterrcnn scored the same vehicles at 0.7-0.99 in nearly every sampled
+frame. A detector that does not detect the traffic defeats the point of the 2026-08-10
+"random to real" rewrite regardless of speed, so fasterrcnn was chosen despite being the
+slower model. `torch.set_num_threads(1)` is set in `TorchvisionDetector.__init__` because
+two `CameraPipeline`s call `detect()` concurrently (each via `asyncio.to_thread`) on a
+small CPU-only server; left at torch's default, one call claims every core and the two
+thrash each other instead of timesharing.
+
+**Rules out.** Treating `TRAFFIC_AI_MODEL_WEIGHTS` as backend-agnostic — it is
+ultralytics-specific (a bundled name or a path) and `build_detector` only reads it in the
+`ultralytics` branch; `TorchvisionDetector` selects its model by its own weights enum and
+never sees that setting. Also rules out assuming fasterrcnn's latency is free: on a small
+CPU server this is materially slower than ssdlite would have been, and the accepted
+mitigation is the existing tuning knobs (`TRAFFIC_AI_DETECT_EVERY_N_FRAMES`,
+`TRAFFIC_AI_FRAME_WIDTH`), not a different model, unless a future session benchmarks a
+faster torchvision detector that still clears the confidence bar on real footage.
+
+**Measured cost against the previous default.** The comparison that matters is not
+ssdlite-vs-fasterrcnn but torchvision-vs-ultralytics, since `ultralytics` was the default
+until this entry. Both were run through the real pipeline over the same footage in the
+same image:
+
+| Backend | Frames processed | Crossings counted | Window |
+| --- | --- | --- | --- |
+| `ultralytics` (yolov8n) | 32 → 346 (~7 fps) | 5 | 45s |
+| `torchvision` (fasterrcnn) | 38 → 137 (~1.5 fps) | 1 | 67s |
+
+Both runs were on a contended macOS Docker VM, so the absolute figures are soft and the
+two windows differ; the direction and rough magnitude are not in doubt — the permissive
+default is several times slower and counts visibly fewer vehicles per unit time. An
+attempted controlled head-to-head on an idle host did not finish: 12 frames through
+fasterrcnn exceeded a 10-minute budget, which is itself a datum.
+
+**This is a live tradeoff, not a closed one.** The default is set for licensing safety, and
+the demo-quality cost is real and measured. If the demo looks sluggish in front of a client,
+the options in order are: raise `TRAFFIC_AI_DETECT_EVERY_N_FRAMES`, lower
+`TRAFFIC_AI_FRAME_WIDTH`, or set `TRAFFIC_AI_DETECTOR=ultralytics` and accept the AGPL
+obligation deliberately. Whether a commercial client demo should ship AGPL detection is the
+maintainer's call and is deliberately left open here.

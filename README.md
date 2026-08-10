@@ -13,7 +13,7 @@ single Linux server behind Docker Compose and Traefik.
 
 | Capability | Status |
 | --- | --- |
-| Vehicle detection (car, motorcycle, bus, truck, bicycle) | Working — YOLO via `ultralytics` |
+| Vehicle detection (car, motorcycle, bus, truck, bicycle) | Working — torchvision by default, YOLO via `ultralytics` opt-in |
 | Multi-object tracking across frames | Working — ByteTrack via `supervision` |
 | Directional counting (incoming / outgoing, by class) | Working — line crossing, edge-triggered |
 | Congestion level from measured flow and density | Working — derived, not hardcoded |
@@ -116,7 +116,7 @@ Replace them with your own footage by dropping files with the same names into
 ## Development
 
 ```bash
-pytest                              # 116 tests; no torch or GPU required
+pytest                              # 119 tests; no torch or GPU required
 ruff check . && ruff format --check .
 ```
 
@@ -130,18 +130,21 @@ installed.
 Every setting is environment-driven with a working default, prefixed `TRAFFIC_AI_` — see
 `src/traffic_ai/config.py` for the full list. The ones that matter for performance on a
 small server are `TRAFFIC_AI_TARGET_FPS`, `TRAFFIC_AI_DETECT_EVERY_N_FRAMES`, and
-`TRAFFIC_AI_FRAME_WIDTH`.
+`TRAFFIC_AI_FRAME_WIDTH`. `TRAFFIC_AI_DETECTOR` picks the detection backend — see
+Licensing note below.
 
 ---
 
 ## Licensing note
 
-This repository is MIT (see `LICENSE`). **`ultralytics`, the default detector, is
-AGPL-3.0**, and the AGPL's network-use clause reaches software served over a network.
-Detection therefore sits behind the `Detector` protocol in `src/traffic_ai/worker/detection.py`,
-so swapping to a permissively-licensed model (YOLOX, RT-DETR — both Apache-2.0) is a
-single-file change. Take your own legal advice before deploying this commercially with the
-default detector.
+This repository is MIT (see `LICENSE`). The default detector is `torchvision`
+(BSD-3-Clause), so the default deployment path carries no AGPL obligation.
+`ultralytics` (YOLOv8) is AGPL-3.0, and the AGPL's network-use clause reaches software
+served over a network — it stays fully supported as an explicit opt-in
+(`TRAFFIC_AI_DETECTOR=ultralytics`), but choosing it takes on that obligation. Detection
+sits behind the `Detector` protocol in `src/traffic_ai/worker/detection.py`, so both
+backends — and any future one — are a `TRAFFIC_AI_DETECTOR` setting away, not a rewrite.
+Take your own legal advice before deploying this commercially with either detector.
 
 ---
 

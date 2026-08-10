@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import numpy as np
 import pytest
+import structlog.testing
+from pydantic import ValidationError
 
+from traffic_ai.config import Settings
 from traffic_ai.domain import VEHICLE_CLASSES
 from traffic_ai.worker.detection import StubDetector, build_detector
 
@@ -53,7 +59,89 @@ def test_build_detector_falls_back_to_stub_without_ultralytics(settings) -> None
     except ImportError:
         pass
 
-    detector = build_detector(settings)
+    detector_settings = settings.model_copy(update={"detector": "ultralytics"})
+    with structlog.testing.capture_logs() as logs:
+        detector = build_detector(detector_settings)
 
     assert isinstance(detector, StubDetector)
     assert detector.is_ready is True
+    assert any(
+        entry["log_level"] == "warning" and "ultralytics" in entry["event"] for entry in logs
+    )
+
+
+def test_build_detector_falls_back_to_stub_without_torchvision(settings) -> None:
+    try:
+        import torch  # noqa: F401
+        import torchvision  # noqa: F401
+
+        pytest.skip("torch/torchvision is installed in this environment")
+    except ImportError:
+        pass
+
+    # `settings` already defaults to `detector="torchvision"`, but set it
+    # explicitly so this test's intent survives a future default change.
+    detector_settings = settings.model_copy(update={"detector": "torchvision"})
+    with structlog.testing.capture_logs() as logs:
+        detector = build_detector(detector_settings)
+
+    assert isinstance(detector, StubDetector)
+    assert detector.is_ready is True
+    assert any(
+        entry["log_level"] == "warning" and "torchvision" in entry["event"] for entry in logs
+    )
+
+
+def test_importing_detection_module_imports_no_inference_library() -> None:
+    """`traffic_ai.worker.detection` must be importable with none of `torch`,
+    `torchvision`, or `ultralytics` in `sys.modules` — both real detectors
+    import their library lazily, inside `__init__`. Checked in a fresh
+    interpreter, mirroring `tests/api/test_app.py`'s worker-isolation check.
+    """
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import traffic_ai.worker.detection, sys; "
+            "assert not [m for m in sys.modules "
+            "if m.split('.')[0] in {'torch', 'torchvision', 'ultralytics'}]",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_settings_rejects_invalid_detector_value() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, detector="not-a-real-detector")  # type: ignore[call-arg]
+
+
+@pytest.mark.requires_inference
+class TestTorchvisionDetector:
+    def test_detects_nothing_above_threshold_on_a_blank_frame(self, settings) -> None:
+        from traffic_ai.worker.detection import TorchvisionDetector
+
+        detector = TorchvisionDetector(
+            device=settings.device,
+            confidence=settings.confidence_threshold,
+            iou=settings.iou_threshold,
+        )
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        detections = detector.detect(frame)
+
+        assert detector.is_ready is True
+        assert set(VEHICLE_CLASSES) <= set(detector.class_names.values())
+        # A blank frame must not break the zero-detection array shapes that
+        # `tracking.py` and `counting.py` expect from `sv.Detections.empty()`.
+        assert len(detections) == 0
+        assert detections.xyxy.shape == (0, 4)
+
+    def test_build_detector_returns_torchvision_detector_by_default(self, settings) -> None:
+        from traffic_ai.worker.detection import TorchvisionDetector
+
+        detector = build_detector(settings)
+
+        assert isinstance(detector, TorchvisionDetector)

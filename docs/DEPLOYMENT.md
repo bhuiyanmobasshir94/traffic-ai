@@ -147,6 +147,20 @@ production attempts; that requires a temporary Traefik command-line change
 (`--certificatesresolvers.le.acme.caserver=...`) not currently wired to an
 env var in `compose.yaml`.
 
+**Certificate not issuing — `ACME_EMAIL` rejected.** Let's Encrypt validates the
+contact address at account registration and refuses reserved example domains
+outright. A placeholder like `you@example.com` fails the whole resolver before
+any challenge is attempted:
+
+```
+Unable to obtain ACME certificate for domains ... 400 :: urn:ietf:params:acme:error:invalidContact
+:: Error validating contact(s) :: contact email has forbidden domain "example.com"
+```
+
+This is not a DNS or firewall problem and the error names the real cause, so
+read the traefik log rather than assuming port 80. Set `ACME_EMAIL` to a real
+mailbox you control. (Observed during local verification of this stack.)
+
 **Certificate not issuing — port 80 blocked.** The most common cause. HTTP-01
 requires Let's Encrypt's servers to reach `http://<your-domain>/.well-known/acme-challenge/...`
 on port 80, unredirected by any upstream firewall, load balancer, or cloud
@@ -169,6 +183,21 @@ headers or terminates idle connections early. Confirm from the browser
 devtools Network tab: a healthy connection shows a `101 Switching Protocols`
 response for `/_stcore/stream`; anything else confirms the upgrade is being
 blocked upstream of this stack.
+
+The upgrade was verified through this stack's own Traefik and does work:
+
+```
+$ curl -sk -i --http1.1 -H "Host: <domain>" -H "Connection: Upgrade" \
+    -H "Upgrade: websocket" -H "Sec-WebSocket-Version: 13" \
+    -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+    https://<domain>/_stcore/stream
+HTTP/1.1 101 Switching Protocols
+```
+
+Note the `--http1.1`. Without it curl negotiates HTTP/2 via ALPN and the
+upgrade headers are silently ignored, returning `200` and the page HTML —
+which looks like a failure but is an artifact of the test, not of the proxy.
+Browsers use HTTP/1.1 for WebSocket handshakes.
 
 ## Security notes
 
