@@ -80,3 +80,101 @@ Until then, "verified" means the app was launched and looked at, and the report 
 Dropped the template's `data-and-migrations` and `reliability-and-performance` rule files
 entirely: their path globs matched zero files, as this project has no models, migrations,
 SQL, jobs, queues, or request handlers.
+
+---
+
+## 2026-08-10 — Inference runs in a separate worker; Streamlit becomes a thin viewer
+
+**Decision.** Split the single Streamlit process into a FastAPI worker that owns video
+decode, detection, tracking, and counting, and a Streamlit UI that only reads results over
+HTTP. Redis carries the handoff. Rejected: running inference inside the Streamlit process.
+
+**Why.** Streamlit reruns its whole script on every interaction, so a pipeline owned by the
+UI restarts and loses all state on any click, cannot serve a second viewer, and blocks the
+thread while it works — which is exactly the failure the previous `time.sleep()` generators
+exhibited.
+
+**Rules out.** Any design where the UI drives the capture loop, and any per-session
+inference state. It also means the UI must degrade visibly when the worker is down rather
+than assuming a result is always available.
+
+---
+
+## 2026-08-10 — Detection sits behind an interface because ultralytics is AGPL-3.0
+
+**Decision.** `Detector` is a Protocol with an `UltralyticsDetector` implementation selected
+at runtime. `ultralytics` is imported inside the constructor, never at module scope.
+
+**Why.** `ultralytics` (YOLOv8) is AGPL-3.0. This repository is MIT and the artifact is a
+client-facing demo served over a network, which is precisely what the AGPL's network-use
+clause reaches. The interface keeps a swap to a permissively-licensed detector (YOLOX,
+RT-DETR — both Apache-2.0) a one-file change instead of a rewrite.
+
+**Rules out.** Calling `ultralytics` directly from pipeline, API, or UI code. It also means
+the test suite must never require torch — detection is stubbed, so the core suite runs on a
+laptop with no inference stack.
+
+**Open.** Whether to ship ultralytics at all is the maintainer's call, not a settled
+technical decision. Flagged, not resolved.
+
+---
+
+## 2026-08-10 — ByteTrack imported from its canonical module, supervision pinned <0.31
+
+**Decision.** Tracking uses `supervision.tracker.byte_tracker.core.ByteTrack`, wrapped in a
+local `VehicleTracker` Protocol. `supervision` is pinned `>=0.30,<0.31`.
+
+**Why.** The top-level `sv.ByteTrack` export is deprecated as of supervision 0.28 and is
+scheduled for removal in 0.31 — verified by the FutureWarning the package emits. The
+canonical module path still works, and the pin makes the upgrade a deliberate act rather
+than something a `poetry update` does silently.
+
+**Rules out.** Using the top-level alias anywhere. When 0.31 lands, the replacement is a
+`VehicleTracker` implementation swap, not a change spread through the pipeline.
+
+---
+
+## 2026-08-10 — One domain, path-prefix routing for the API
+
+**Decision.** Traefik serves the UI at `${DOMAIN}/` and the worker at `${DOMAIN}/api`, with
+an explicit router priority so the `/api` rule wins. Rejected: `api.${DOMAIN}` as a separate
+subdomain.
+
+**Why.** One DNS A record, one certificate, one Let's Encrypt challenge, and no CORS
+preflight — the browser fetches the MJPEG stream same-origin. Materially less to set up and
+fewer ways for a demo to fail on someone else's network.
+
+**Rules out.** Serving the API on its own hostname without revisiting `api_public_url` and
+the CORS posture, which is currently "not needed because same-origin."
+
+---
+
+## 2026-08-10 — Redis holds ephemeral state with a TTL, and is not a database
+
+**Decision.** Every key the worker writes carries a TTL. Persistence is off (`--save ""`,
+`--appendonly no`) with an LRU memory cap.
+
+**Why.** The dashboard must be able to distinguish "live", "stale", and "no data". If state
+outlived the process that produced it, a dead worker would leave a dashboard that looks
+current — the worst of the three states, because it is silently wrong.
+
+**Rules out.** Using this Redis for anything needing durability: historical queries, replay,
+audit, or counts that must survive a restart. Counters reset when the worker restarts, by
+design. A real time-series store is a separate decision if that is ever needed.
+
+---
+
+## 2026-08-10 — No plate is ever fabricated; ANPR is a disabled seam
+
+**Decision.** `CrossingEvent.plate_text` is `None` unless a real plate model read it. A
+`PlateReader` Protocol and `NullPlateReader` exist; `anpr_enabled` without a configured model
+is a startup error, not a silent fallback. The UI renders `—` and says the stage is off.
+
+**Why.** The previous demo generated random plate strings, and the README described an OCR
+capability that did not exist. Reintroducing invented plates into a build whose entire point
+is that the numbers are real would recreate exactly the credibility problem being fixed.
+Bengali-script plates on Bangladeshi vehicles are also not something generic OCR reads, so a
+half-working stage would misrepresent capability in front of a client.
+
+**Rules out.** Any placeholder, sample, or "representative" plate value in code, fixtures, or
+UI. `None` means not read — never unreadable, never a stand-in.
