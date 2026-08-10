@@ -1,0 +1,4 @@
+{
+  "changelogDir": "docs/changelogs",
+  "decisionFile": "docs/decisions/DECISIONS.md"
+}
