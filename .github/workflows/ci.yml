@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The `ui` extra only. The `worker` extra pulls ultralytics, which pulls
+      # torch — this suite is designed to run without either, per
+      # tests/conftest.py. Installed with pip rather than Poetry so CI does not
+      # depend on a lockfile: resolving torch's graph with Poetry is slow enough
+      # to be unreliable, and the images resolve with pip too (docker/).
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[ui]"
+          pip install pytest pytest-asyncio ruff fakeredis pyyaml
+
+      - name: Lint
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Test
+        run: pytest
+
+  compose-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate compose.yaml
+        run: |
+          cp .env.example .env
+          docker compose config -q

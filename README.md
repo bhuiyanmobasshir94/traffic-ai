@@ -1,53 +1,153 @@
 # Traffic-AI
-![Traffic AI](https://i.imgur.com/foP5Xto.jpg)
 
-Our project represents a groundbreaking advancement in traffic analysis and toll collection systems, leveraging cutting-edge technologies including computer vision, deep learning algorithms, and real-time data processing. Our technology is intended to improve traffic management, ensure road safety, and accelerate toll collection procedures in the dynamic traffic environment of Bangladesh.
+Toll-booth and traffic-congestion monitoring for Dhaka. Vehicles are detected and tracked
+in video, counted as they cross a virtual line, and the resulting flow is rendered on a
+live dashboard with the annotated feed beside it.
 
-## Key Features:
+Built by [Graaho Technologies](https://graaho.com) as a client-facing demo. It runs on a
+single Linux server behind Docker Compose and Traefik.
 
-### Vehicle Detection and Classification:
- Utilizing state-of-the-art deep learning models such as YOLOv8, our system accurately detects and classifies vehicles based on their types (e.g., cars, buses, motorcycles, trucks).
+---
 
-### Real-time Tracking:
-Implementing the DeepSORT algorithm, our system tracks vehicles seamlessly across frames, enabling continuous monitoring of their movements within the traffic flow.
+## What it actually does
 
-### Number Plate Recognition (NPR):
-Through computer vision techniques, our system can identify and track vehicle number plates, facilitating various functions including toll collection, vehicle identification, and automated fine enforcement.
+| Capability | Status |
+| --- | --- |
+| Vehicle detection (car, motorcycle, bus, truck, bicycle) | Working — torchvision by default, YOLO via `ultralytics` opt-in |
+| Multi-object tracking across frames | Working — ByteTrack via `supervision` |
+| Directional counting (incoming / outgoing, by class) | Working — line crossing, edge-triggered |
+| Congestion level from measured flow and density | Working — derived, not hardcoded |
+| Annotated live video in the browser | Working — MJPEG, server-side annotation |
+| Map with per-corridor congestion colouring | Working — Folium, colour from live state |
+| **Number-plate recognition (ANPR)** | **Not implemented — see below** |
+| Speed estimation | Not implemented |
+| Automated toll charging / fine enforcement | Not implemented |
 
-### Speed Tracking:
-By analyzing the movement patterns of vehicles, our system calculates their speeds in real-time, allowing authorities to identify speeding vehicles and enforce speed limits effectively.
+### On number plates
 
-### Traffic Flow Analysis:
-Our system provides insights into traffic dynamics by tracking incoming and outgoing vehicles based on their classes. This data aids in traffic management, capacity planning, and congestion mitigation efforts.
+The pipeline has a `PlateReader` seam (`src/traffic_ai/worker/anpr.py`) and every crossing
+event carries a `plate_text` field, but **no plate model ships with this project and no
+plate is ever read.** `plate_text` is always `None`, which means *not read* — never
+"unreadable", and never a placeholder. The dashboard shows `—` and says the stage is off.
 
-### Automated Toll Collection:
-![Toll Collection Demo](https://i.imgur.com/XJepOLA.jpg)
-Leveraging NPR and real-time data processing capabilities, our system enables automated toll collection by scanning vehicle number plates as they pass through toll gates. This streamlines toll operations, reduces congestion, and minimizes manual intervention.
+Enabling ANPR without configuring a model is a startup error rather than a silent
+fallback, so the system cannot be made to look like it is reading plates when it is not.
+Bengali-script plates in particular are not something a general-purpose OCR handles; that
+is a modelling project, not a configuration flag.
 
-### Automated Fine Enforcement: 
-In cases of traffic violations or unpaid tolls, our system automatically generates fines by capturing relevant vehicle data, including number plates and timestamps. This enhances enforcement efficiency and ensures compliance with traffic regulations.
+> **Note on history.** Before 2026-08-10 this README described YOLOv8, DeepSORT, OCR, and
+> "models fine-tuned on Bangladeshi vehicle datasets" while the code contained none of it —
+> every plate and count came from `random.choice()` and the camera feeds were YouTube
+> embeds. The detection, tracking, and counting described above are now real. The claims
+> that were not backed by code have been removed rather than restated.
 
-### User-Friendly Interface:
-The system features an intuitive interface accessible to traffic authorities, enabling them to monitor traffic conditions, view analytics, and manage toll operations efficiently.
+---
 
-### Technological Components:
+## Architecture
 
-In developing our Advanced Traffic Analysis and Automated Toll Collection System for Bangladesh, we relied on a sophisticated array of technologies and tools. Our project seamlessly integrates Python programming language with OpenCV (Open Source Computer Vision Library), YOLOv8 (You Only Look Once), and a diverse range of algorithms, including the DeepSORT algorithm. Additionally, we employed Optical Character Recognition (OCR) technology to accurately read vehicle number plates, enhancing the system's functionality.
-
-### Custom Deep Learning Models:
-
-To meet the specific requirements of our project within the Bangladeshi context, we meticulously trained and deployed various deep learning custom models. These models were fine-tuned using datasets comprising Bangladeshi vehicles, ensuring precise vehicle detection, classification, and tracking capabilities tailored to the unique characteristics of the region's traffic patterns.
-
-By leveraging this comprehensive technological framework, our system achieves unparalleled accuracy and efficiency in traffic analysis, toll collection, and enforcement tasks. Through continuous refinement and adaptation, we remain committed to advancing the capabilities of our system to address the evolving challenges of traffic management in Bangladesh.
-
-By harnessing advanced technologies, our project revolutionizes traffic management and toll collection processes in Bangladesh. It promotes road safety, reduces congestion, optimizes resource utilization, and enhances overall transportation efficiency. With real-time insights and automated functionalities, our system empowers authorities to make informed decisions and uphold traffic regulations effectively.
-
-## Setup environment to run the project 
-#### Poetry to requirements.txt
 ```
-poetry export --without-hashes --format=requirements.txt > requirements.txt
+                        :80 / :443
+                            │
+                     ┌──────▼──────┐
+                     │   traefik   │  TLS via Let's Encrypt
+                     └──────┬──────┘
+        Host(${DOMAIN}) && PathPrefix(/api) → worker   (priority 100)
+        Host(${DOMAIN})                     → ui       (priority 1)
+              ┌─────────────┴─────────────┐
+              ▼                           ▼
+      ┌───────────────┐          ┌─────────────────┐
+      │ ui (Streamlit)│─────────▶│ worker (FastAPI)│
+      │     :8501     │   HTTP   │      :8000      │
+      └───────────────┘          └────────┬────────┘
+                                          │  detect → track → count → annotate
+                                          ▼
+                                   ┌─────────────┐
+                                   │    redis    │  TTL'd state + frames
+                                   └─────────────┘
 ```
-#### To run this project
+
+Inference runs in the worker, never in the UI. Streamlit reruns its entire script on every
+interaction, so a pipeline owned by the UI would restart on every click, lose its counters,
+and be unable to serve a second viewer. The worker owns the loop; the UI reads the latest
+result and the browser streams the annotated video directly.
+
+Redis holds state with a TTL and no persistence. If the worker dies its state expires, so
+the dashboard reports *stale* rather than showing frozen numbers as though they were live.
+
+| Module | Responsibility |
+| --- | --- |
+| `src/traffic_ai/domain.py` | The contract between worker and UI. Changing it is an API change. |
+| `src/traffic_ai/cameras.py` | Camera registry and map geometry — coordinates live here once. |
+| `src/traffic_ai/worker/` | Detection, tracking, counting, annotation, pipeline loop. |
+| `src/traffic_ai/api/` | FastAPI service; owns pipeline startup and shutdown. |
+| `src/traffic_ai/ui/` | Streamlit viewer: API client, components, one shared dashboard. |
+
+---
+
+## Quick start
+
+Requires Python 3.12+ and Poetry, or just Docker.
+
+```bash
+# 1. Fetch the demo footage (~65 MB, MD5-verified)
+make videos
+
+# 2a. Whole stack in Docker
+cp .env.example .env        # set DOMAIN and ACME_EMAIL
+docker compose up --build
+
+# 2b. Or locally, in two shells (needs a Redis on :6379)
+poetry install --extras "ui worker"
+python -m traffic_ai.api                    # worker → http://localhost:8000
+streamlit run Toll_Booth.py                 # UI     → http://localhost:8501
 ```
-streamlit run Toll_Booth.py --server.runOnSave true
+
+For deploying to a real server with TLS, see **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**.
+
+### Demo footage
+
+The two demo clips come from the Roboflow `supervision` example assets and are downloaded
+at setup time, not committed. Provenance is recorded in `data/videos/ATTRIBUTION.md`.
+Replace them with your own footage by dropping files with the same names into
+`data/videos/` — the filenames are declared in `src/traffic_ai/cameras.py`.
+
+---
+
+## Development
+
+```bash
+pytest                              # 119 tests; no torch or GPU required
+ruff check . && ruff format --check .
 ```
+
+The test suite deliberately does **not** depend on `torch` or `ultralytics`. Detection runs
+behind a `Detector` protocol with a deterministic `StubDetector` for tests, so the suite is
+fast and runs anywhere. Tests marked `requires_inference` skip unless the real stack is
+installed.
+
+### Configuration
+
+Every setting is environment-driven with a working default, prefixed `TRAFFIC_AI_` — see
+`src/traffic_ai/config.py` for the full list. The ones that matter for performance on a
+small server are `TRAFFIC_AI_TARGET_FPS`, `TRAFFIC_AI_DETECT_EVERY_N_FRAMES`, and
+`TRAFFIC_AI_FRAME_WIDTH`. `TRAFFIC_AI_DETECTOR` picks the detection backend — see
+Licensing note below.
+
+---
+
+## Licensing note
+
+This repository is MIT (see `LICENSE`). The default detector is `torchvision`
+(BSD-3-Clause), so the default deployment path carries no AGPL obligation.
+`ultralytics` (YOLOv8) is AGPL-3.0, and the AGPL's network-use clause reaches software
+served over a network — it stays fully supported as an explicit opt-in
+(`TRAFFIC_AI_DETECTOR=ultralytics`), but choosing it takes on that obligation. Detection
+sits behind the `Detector` protocol in `src/traffic_ai/worker/detection.py`, so both
+backends — and any future one — are a `TRAFFIC_AI_DETECTOR` setting away, not a rewrite.
+Take your own legal advice before deploying this commercially with either detector.
+
+---
+
+*Capabilities table and module map verified against the code on branch
+`worktree-production-demo`, 2026-08-10. If you are reading this much later, check `git log`
+before trusting it.*

@@ -1,0 +1,34 @@
+# Build context hygiene. Both docker/Dockerfile.ui and docker/Dockerfile.worker
+# build from the repo root, so anything not needed inside an image — and
+# anything that would bloat the context sent to the daemon — is excluded here.
+
+.git
+.gitignore
+.venv
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+.claude
+.github
+
+tests/
+docs/
+
+# Demo footage: fetched by scripts/fetch_demo_videos.py, mounted read-only
+# into the worker container at runtime — never baked into an image.
+data/videos/*.mp4
+
+# Local-only / secret material — never sent to the build daemon.
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+letsencrypt/
+
+*.md
+!README.md

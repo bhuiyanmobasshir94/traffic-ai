@@ -1,17 +1,101 @@
 [tool.poetry]
 name = "traffic-ai"
-version = "0.1.0"
-description = ""
+version = "1.0.0"
+description = "Toll-booth and traffic congestion monitoring — real-time vehicle detection, tracking, and counting over demo footage."
 authors = ["bhuiyanmobasshir94"]
 readme = "README.md"
+license = "MIT"
+packages = [{ include = "traffic_ai", from = "src" }]
 
 [tool.poetry.dependencies]
-python = ">=3.9,<3.9.7 || >3.9.7,<4.0"
-streamlit = "^1.31.1"
-folium = "^0.15.1"
-streamlit-folium = "^0.18.0"
+python = "^3.12"
 
+# Shared by every service. Kept deliberately small so the UI image does not
+# pull the inference stack (torch alone is ~800MB).
+pydantic = "^2.13"
+pydantic-settings = "^2.15"
+structlog = "^26.1"
+redis = "^8.1"
+httpx = "^0.28"
+orjson = "^3.11"
+
+# --- extras ---------------------------------------------------------------
+# Installed per-image: the UI container gets [ui], the worker gets [worker].
+streamlit = { version = "^1.61", optional = true }
+folium = { version = "^0.20", optional = true }
+streamlit-folium = { version = "^0.27", optional = true }
+
+fastapi = { version = "^0.141", optional = true }
+uvicorn = { version = "^0.52", extras = ["standard"], optional = true }
+# torchvision is the DEFAULT detector (BSD-3-Clause) — see Settings.detector.
+# It must be installed from the same index as torch or its compiled ops fail at
+# inference with "operator torchvision::nms does not exist"; docker/Dockerfile.worker
+# installs both from the PyTorch CPU index in one command.
+torchvision = { version = "^0.20", optional = true }
+ultralytics = { version = "^8.4", optional = true }
+# Pinned below 0.31: supervision schedules the removal of its ByteTrack export
+# there. We import the canonical module path behind our own tracker interface
+# (worker/tracking.py), so the swap is one file — but the pin keeps it a choice.
+supervision = { version = ">=0.30,<0.31", optional = true }
+# Held on the 4.x line deliberately. opencv 5.x is very new and neither
+# ultralytics nor supervision has settled on it.
+opencv-python-headless = { version = "^4.10", optional = true }
+numpy = { version = "^2.1", optional = true }
+
+[tool.poetry.extras]
+ui = ["streamlit", "folium", "streamlit-folium"]
+worker = [
+    "fastapi",
+    "uvicorn",
+    "torchvision",
+    "ultralytics",
+    "supervision",
+    "opencv-python-headless",
+    "numpy",
+]
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.1"
+pytest-asyncio = "^1.4"
+ruff = "^0.16"
+fakeredis = "^2.37"
 
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
+
+# --------------------------------------------------------------------------
+# Tooling
+# --------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # bugbear
+    "UP",   # pyupgrade
+    "S",    # bandit
+    "C4",   # comprehensions
+    "SIM",  # simplify
+    "RUF",
+]
+ignore = [
+    "S104",  # binding 0.0.0.0 is intentional inside a container
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]  # assert is the point of a test
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q --strict-markers"
+markers = [
+    "requires_inference: needs torch/ultralytics installed (skipped by default)",
+]

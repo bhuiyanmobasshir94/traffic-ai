@@ -4,3 +4,13 @@ primaryColor="#6eb52f"
 secondaryBackgroundColor="#e0e0ef"
 textColor="#262730"
 font="sans serif"
+
+[server]
+headless = true
+enableCORS = false
+enableXsrfProtection = true
+address = "0.0.0.0"
+port = 8501
+
+[browser]
+gatherUsageStats = false

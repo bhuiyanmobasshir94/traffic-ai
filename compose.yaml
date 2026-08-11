@@ -1,0 +1,158 @@
+# Compose Spec (no `version:` key — obsolete since the schema merge).
+#
+# traefik terminates TLS on ${DOMAIN} and routes:
+#   Host(${DOMAIN}) && PathPrefix(/api)  -> worker   (higher priority, checked first)
+#   Host(${DOMAIN})                      -> ui        (catch-all)
+#
+# redis and worker are never published to the host — only traefik binds
+# ports 80/443. See docs/DEPLOYMENT.md for the operator runbook.
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  traefik:
+    image: traefik:v3.7
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedByDefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.le.acme.httpchallenge=true
+      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
+      - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
+      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+      - --api.dashboard=false
+      - --ping=true
+      - --log.level=${TRAEFIK_LOG_LEVEL:-INFO}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Read-only: still effectively root on the host (a container that can
+      # talk to the Docker socket can launch other containers as root). This
+      # is the accepted risk of the Docker provider — see docs/DEPLOYMENT.md.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - letsencrypt:/letsencrypt
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging: *default-logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: >
+      redis-server
+      --save ""
+      --appendonly no
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    logging: *default-logging
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      TRAFFIC_AI_ENVIRONMENT: production
+      TRAFFIC_AI_LOG_LEVEL: ${TRAFFIC_AI_LOG_LEVEL:-INFO}
+      TRAFFIC_AI_LOG_FORMAT: ${TRAFFIC_AI_LOG_FORMAT:-json}
+      TRAFFIC_AI_REDIS_URL: redis://redis:6379/0
+      TRAFFIC_AI_VIDEO_DIR: /data/videos
+      TRAFFIC_AI_MODEL_WEIGHTS: ${TRAFFIC_AI_MODEL_WEIGHTS:-/app/weights/yolov8n.pt}
+      TRAFFIC_AI_DEVICE: ${TRAFFIC_AI_DEVICE:-cpu}
+      TRAFFIC_AI_TARGET_FPS: ${TRAFFIC_AI_TARGET_FPS:-12}
+      TRAFFIC_AI_DETECT_EVERY_N_FRAMES: ${TRAFFIC_AI_DETECT_EVERY_N_FRAMES:-2}
+      TRAFFIC_AI_FRAME_WIDTH: ${TRAFFIC_AI_FRAME_WIDTH:-960}
+    volumes:
+      # Read-only: the worker only ever reads demo footage, never writes it.
+      - ./data/videos:/data/videos:ro
+      # Named volume so a container restart does not re-download YOLO weights.
+      - model-weights:/app/weights
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request as u,sys; sys.exit(0 if u.urlopen('http://127.0.0.1:8000/api/healthz', timeout=3).status == 200 else 1)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.worker.rule=Host(`${DOMAIN}`) && PathPrefix(`/api`)
+      - traefik.http.routers.worker.entrypoints=websecure
+      - traefik.http.routers.worker.tls.certresolver=le
+      # Explicit and higher than the ui router's — PathPrefix(/api) must win
+      # over the catch-all Host() rule regardless of rule-length ordering.
+      - traefik.http.routers.worker.priority=100
+      - traefik.http.services.worker.loadbalancer.server.port=8000
+    logging: *default-logging
+    # Not directly reachable — no `ports:`. Traefik proxies to it over the
+    # compose-internal network only.
+
+  ui:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ui
+    restart: unless-stopped
+    depends_on:
+      worker:
+        condition: service_healthy
+    environment:
+      TRAFFIC_AI_ENVIRONMENT: production
+      TRAFFIC_AI_LOG_LEVEL: ${TRAFFIC_AI_LOG_LEVEL:-INFO}
+      TRAFFIC_AI_LOG_FORMAT: ${TRAFFIC_AI_LOG_FORMAT:-json}
+      TRAFFIC_AI_REDIS_URL: redis://redis:6379/0
+      # Server-to-server default (traffic_ai.config.Settings.api_internal_url)
+      # already resolves to this; set explicitly so it survives a settings
+      # default change without editing compose.yaml.
+      TRAFFIC_AI_API_INTERNAL_URL: http://worker:8000
+      # Browser-facing: relative, so it rides the same Host/TLS as the UI —
+      # one DNS record, one certificate, no CORS.
+      TRAFFIC_AI_API_PUBLIC_URL: /api
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request as u,sys; sys.exit(0 if u.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=3).status == 200 else 1)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.ui.rule=Host(`${DOMAIN}`)
+      - traefik.http.routers.ui.entrypoints=websecure
+      - traefik.http.routers.ui.tls.certresolver=le
+      - traefik.http.routers.ui.priority=1
+      - traefik.http.services.ui.loadbalancer.server.port=8501
+    logging: *default-logging
+    # Not directly reachable — no `ports:`. Traefik proxies to it (including
+    # the /_stcore/stream WebSocket upgrade — see docs/DEPLOYMENT.md).
+
+volumes:
+  letsencrypt:
+  model-weights:

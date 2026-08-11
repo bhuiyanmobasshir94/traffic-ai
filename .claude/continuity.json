@@ -1,0 +1,9 @@
+{
+  "changelogDir": "docs/changelogs",
+  "decisionFile": "docs/decisions/DECISIONS.md",
+  "verifyCommands": [
+    "pytest -q",
+    "ruff check .",
+    "ruff format --check ."
+  ]
+}
