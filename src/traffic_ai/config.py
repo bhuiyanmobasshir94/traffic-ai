@@ -16,13 +16,17 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # The password baked into the local-development database URL below. Deploying
 # with this still in place is a configuration error, not a style preference, so
 # it is named here and checked for explicitly.
 DEV_DATABASE_PASSWORD = "traffic"  # noqa: S105 - a known-bad default, not a credential
+
+# Floor on API token length, enforced in production only. Matches the
+# `openssl rand -hex 32` recipe in the deployment docs (64 hex characters).
+MIN_API_TOKEN_LENGTH = 32
 
 
 class Settings(BaseSettings):
@@ -139,6 +143,22 @@ class Settings(BaseSettings):
         """True when a token is configured and must be presented."""
         return self.api_token is not None
 
+    @field_validator("api_token", mode="before")
+    @classmethod
+    def _blank_token_is_absent(cls, value: object) -> object:
+        """Treat an empty or whitespace-only token as no token at all.
+
+        compose.yaml passes `TRAFFIC_AI_API_TOKEN: ${TRAFFIC_AI_API_TOKEN:-}`, so an
+        operator who never set the variable sends an empty string rather than nothing.
+        Without this, pydantic would build `SecretStr("")` -- `auth_enabled` would report
+        True and the token comparison would accept an empty bearer, which is strictly
+        worse than having no auth, because it looks authenticated. Collapsing blank to
+        None means the production validator below catches it and refuses to start.
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     @model_validator(mode="after")
     def _production_requires_hardening(self) -> Settings:
         """Refuse to build an unsafe production configuration.
@@ -156,6 +176,17 @@ class Settings(BaseSettings):
             problems.append(
                 "TRAFFIC_AI_API_TOKEN is unset. Set it to a long random value, or set "
                 "TRAFFIC_AI_ALLOW_UNAUTHENTICATED=true to run the API open on purpose."
+            )
+        # A short token is brute-forceable over a public endpoint, and a rate limiter
+        # only slows that down. 32 characters is the floor for the `openssl rand -hex 32`
+        # output the deployment docs tell operators to generate.
+        elif (
+            self.api_token is not None
+            and len(self.api_token.get_secret_value()) < MIN_API_TOKEN_LENGTH
+        ):
+            problems.append(
+                f"TRAFFIC_AI_API_TOKEN is shorter than {MIN_API_TOKEN_LENGTH} characters. "
+                "Generate one with `openssl rand -hex 32`."
             )
 
         if self.persistence_enabled and f":{DEV_DATABASE_PASSWORD}@" in self.database_url:
