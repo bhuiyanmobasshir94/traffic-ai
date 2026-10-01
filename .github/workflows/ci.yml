@@ -5,41 +5,170 @@ on:
     branches: [main]
   pull_request:
 
+# Nothing here writes to the repository, a registry, or the security tab, and
+# no job needs a secret. Jobs inherit read-only access; widen per job if one
+# ever needs more.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep in step with ARG UV_VERSION in docker/Dockerfile.* — a lockfile written
+  # by one uv version and checked by another can differ on format alone.
+  UV_VERSION: "0.11.25"
+  PYTHON_VERSION: "3.12"
+
 jobs:
-  test:
+  # A dependency edit without a relock fails here, before anything installs.
+  # `--check` re-resolves against pyproject.toml and exits non-zero if uv.lock
+  # would change; it does not write.
+  lockfile:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
-          python-version: "3.12"
+          version: ${{ env.UV_VERSION }}
 
-      # The `ui` extra only. The `worker` extra pulls ultralytics, which pulls
-      # torch — this suite is designed to run without either, per
-      # tests/conftest.py. Installed with pip rather than Poetry so CI does not
-      # depend on a lockfile: resolving torch's graph with Poetry is slow enough
-      # to be unreliable, and the images resolve with pip too (docker/).
+      - name: Verify uv.lock is current
+        run: uv lock --check
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      # Lint needs only ruff, which the `test` extra carries at the version
+      # uv.lock pins. --locked installs exactly uv.lock and fails if
+      # pyproject.toml has moved on without it.
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[ui]"
-          pip install pytest pytest-asyncio ruff fakeredis pyyaml
+        run: uv sync --locked --extra test
 
       - name: Lint
         run: |
-          ruff check .
-          ruff format --check .
+          uv run --no-sync ruff check .
+          uv run --no-sync ruff format --check .
 
+  test:
+    runs-on: ubuntu-latest
+
+    # Throwaway database for the `requires_postgres` tests, so they run here
+    # instead of skipping. The suite drops and recreates the schema on every
+    # test (tests/db/test_repository.py), which is only safe against a database
+    # that exists for this job alone. These credentials guard nothing: the
+    # container is unreachable from outside the runner and dies with the job.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: traffic
+          POSTGRES_PASSWORD: traffic-ci-only
+          POSTGRES_DB: traffic_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U traffic -d traffic_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TRAFFIC_AI_TEST_DATABASE_URL: postgresql+asyncpg://traffic:traffic-ci-only@localhost:5432/traffic_test
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      # `ui` as well as `test`: tests/ui/ imports streamlit and folium, which
+      # the `test` extra deliberately does not carry.
+      - name: Install dependencies
+        run: uv sync --locked --extra ui --extra test
+
+      # Prove the migrations apply to a real Postgres before the suite runs.
+      # alembic.ini carries no URL — migrations/env.py reads Settings.database_url,
+      # i.e. TRAFFIC_AI_DATABASE_URL — so point that at the service container.
+      # Tolerant of the migration tooling not being present on a branch yet.
+      - name: Apply migrations
+        env:
+          TRAFFIC_AI_DATABASE_URL: ${{ env.TRAFFIC_AI_TEST_DATABASE_URL }}
+        run: |
+          if [ -f alembic.ini ]; then
+            uv run --no-sync alembic upgrade head
+          else
+            echo "::notice::alembic.ini not found - skipping migrations"
+          fi
+
+      # -rs lists skips with their reasons, so a requires_postgres test that
+      # silently stops running shows up in the log rather than only as a lower
+      # pass count.
       - name: Test
-        run: pytest
+        run: uv run --no-sync pytest -rs
+
+  # Without uv the project must still install: `pip install -e ".[test]"` is the
+  # contributor path that does not depend on uv.lock. Dry-run only — it proves
+  # the migrated pyproject.toml and its extras resolve under pip without
+  # installing, and without running the suite a second time against unpinned
+  # versions.
+  pip-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Resolve extras with pip
+        run: |
+          python -m pip install --upgrade pip
+          pip install --dry-run -e ".[ui,test]"
 
   compose-config:
     runs-on: ubuntu-latest
+    # Set explicitly so validation does not depend on .env.example carrying
+    # values (it deliberately carries none for these two).
+    env:
+      DOMAIN: traffic.example.org
+      ACME_EMAIL: ops@traffic.example.org
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Validate compose.yaml
         run: |
           cp .env.example .env
           docker compose config -q
+
+  # Guarded on the chart existing, so the job passes cleanly on a branch that
+  # has no deploy/helm yet and starts linting the moment one appears. Uses the
+  # Helm preinstalled on the runner image.
+  helm-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Lint Helm charts
+        run: |
+          charts=$(find deploy/helm -name Chart.yaml 2>/dev/null || true)
+          if [ -z "$charts" ]; then
+            echo "::notice::No Helm chart under deploy/helm - skipping"
+            exit 0
+          fi
+          helm version --short
+          for chart in $charts; do
+            helm lint "$(dirname "$chart")"
+          done

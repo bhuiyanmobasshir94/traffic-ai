@@ -1,46 +1,78 @@
 # syntax=docker/dockerfile:1
 #
-# Worker image — the inference API. Installs the `worker` extra plus a
-# CPU-only torch build. ultralytics depends on torch transitively; without
-# installing torch first from the CPU wheel index, pip resolves the default
-# CUDA-enabled build, which is roughly 2.5GB larger than this deployment
-# (CPU-only inference) ever needs.
+# Worker image — the inference API. Installs the `worker` extra exactly as
+# pinned in uv.lock; nothing is resolved at build time.
 #
-# torchvision must be installed in the SAME command, from the SAME index.
-# It ships compiled ops that ultralytics calls for non-maximum suppression;
-# a torchvision resolved from the default index against a CPU-only torch
-# loads but fails at inference with:
+# CPU-only torch: ultralytics depends on torch transitively, and resolving it
+# against the default index yields the CUDA-enabled build, roughly 2.5GB larger
+# than this deployment (CPU-only inference) ever needs.
+#
+# torch and torchvision must come from the SAME index. torchvision ships
+# compiled ops that ultralytics calls for non-maximum suppression; a
+# torchvision resolved from the default index against a CPU-only torch loads
+# but fails at inference with:
 #     operator torchvision::nms does not exist
 # That surfaces only when a detection actually needs NMS, so it passes a
 # startup healthcheck and then breaks the pipeline under real footage.
+#
+# That pairing used to be enforced by install order (torch + torchvision first,
+# from the CPU index, in one pip command). It is now enforced by the lockfile:
+# pyproject.toml [tool.uv.sources] pins both packages to the PyTorch CPU index,
+# and `uv sync --locked` installs only what uv.lock records, so the pair cannot
+# drift and a stale lock fails the build instead of resolving something new.
+# The import check at the end of the builder stage still runs the real NMS op,
+# so the failure above is caught at build time rather than under footage.
+
+ARG UV_VERSION=0.11.25
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 
 FROM python:3.12-slim-bookworm AS builder
 
+COPY --from=uv /uv /bin/uv
+
+# UV_PYTHON_DOWNLOADS=never: the venv must be built on this image's interpreter,
+# because the runtime stage copies /opt/venv across and its symlinks must
+# resolve to the same /usr/local/bin/python there.
+# UV_LINK_MODE=copy: the cache mount below is a different filesystem from
+# /opt/venv, so uv cannot hardlink out of it.
 ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_PYTHON=/usr/local/bin/python \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1
 
 WORKDIR /build
 
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:${PATH}"
-
 # --- dependency layer -------------------------------------------------
-# Same stub-package trick as the UI image (see docker/Dockerfile.ui) so the
-# dependency install is a separate, source-independent layer. Torch goes in
-# first, from the CPU wheel index, so when pip later resolves ultralytics'
-# own torch requirement it is already satisfied and never reaches for the
-# CUDA build from the default index.
-COPY pyproject.toml README.md ./
-RUN mkdir -p src/traffic_ai \
-    && touch src/traffic_ai/__init__.py \
-    && pip install --upgrade pip \
-    && pip install --extra-index-url https://download.pytorch.org/whl/cpu torch torchvision \
-    && pip install ".[worker]"
+# --no-install-project installs only third-party dependencies, so this layer
+# depends on pyproject.toml and uv.lock alone and is invalidated only when one
+# of them changes — never by a source edit. (This replaces the old stub-package
+# trick; uv needs no stub because it does not build the project here.)
+# --locked fails the build if uv.lock no longer matches pyproject.toml.
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev --no-install-project --extra worker
 
 # --- source layer -------------------------------------------------------
+# Real source goes in afterwards. --no-editable installs a built wheel into
+# the venv, so the runtime stage does not need /build. The extras flag must
+# match the layer above or uv would prune what that layer installed.
+# README.md is read by the build backend (pyproject `readme`).
+COPY README.md ./
 COPY src ./src
-RUN pip install --no-deps --force-reinstall .
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev --no-editable --extra worker
+
+ENV PATH="/opt/venv/bin:${PATH}"
+
+# Fail the build, not the first detection, if the torch/torchvision pairing is
+# broken or a CUDA build slipped in. Runs the compiled NMS op for real.
+RUN python -c "import torch, torchvision; from torchvision.ops import nms; \
+assert torch.version.cuda is None, 'CUDA build of torch installed'; \
+keep = nms(torch.tensor([[0., 0., 10., 10.], [1., 1., 11., 11.], [50., 50., 60., 60.]]), \
+torch.tensor([0.9, 0.8, 0.7]), 0.5); \
+assert keep.tolist() == [0, 2], keep.tolist()"
 
 FROM python:3.12-slim-bookworm AS runtime
 
@@ -60,6 +92,14 @@ RUN groupadd --system --gid 1000 app \
 COPY --from=builder /opt/venv /opt/venv
 
 WORKDIR /app
+
+# Alembic runs from the working directory: alembic.ini sets script_location =
+# migrations and the URL comes from Settings.database_url. Whole directory, so
+# new revisions are picked up without touching this file. Deliberately not
+# guarded — if either path is missing the build fails, rather than shipping an
+# image that cannot migrate its own database.
+COPY --chown=app:app alembic.ini ./
+COPY --chown=app:app migrations ./migrations
 
 # Created (and owned) at build time so Docker copies this ownership onto a
 # fresh named volume the first time compose.yaml mounts one here — an empty

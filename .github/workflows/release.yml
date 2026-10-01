@@ -1,0 +1,127 @@
+name: Release
+
+# Builds and publishes both images (worker, ui) to GitHub Container Registry as
+# multi-arch manifests, with an SBOM and provenance attestation on each, then
+# scans what was pushed and reports to the Security tab.
+#
+# Authentication is the workflow's own GITHUB_TOKEN. There is no registry
+# credential in this file or in repository secrets.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Read-only by default. The one job below widens exactly what it needs.
+permissions:
+  contents: read
+
+# A second tag push must not cancel a release that is half-published.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  # Keep in step with ARG UV_VERSION in docker/Dockerfile.* and ci.yml.
+  UV_VERSION: "0.11.25"
+
+jobs:
+  images:
+    name: image (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    # arm64 is built under QEMU emulation, and the worker image carries torch;
+    # allow for the slow path.
+    timeout-minutes: 120
+
+    permissions:
+      contents: read          # checkout
+      packages: write         # push to ghcr.io
+      security-events: write  # upload the Trivy SARIF
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: worker
+            dockerfile: docker/Dockerfile.worker
+          - image: ui
+            dockerfile: docker/Dockerfile.ui
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Registry paths must be lowercase; the repository path need not be.
+      - name: Compute image name
+        id: name
+        run: echo "image=${REGISTRY}/${GITHUB_REPOSITORY,,}-${{ matrix.image }}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # On a v* tag: 1.2.3, 1.2 (not for pre-releases) and `latest` (the
+      # action's default flavor, also not for pre-releases), plus sha-<short>.
+      # On a manual dispatch there is no semver tag, so only sha-<short> is
+      # produced.
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.name.outputs.image }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            UV_VERSION=${{ env.UV_VERSION }}
+          # One cache scope per image so the worker's torch layers and the UI's
+          # layers do not evict each other. mode=max also caches the builder
+          # stage, which is where the dependency layer lives.
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          # Attached to the pushed manifest as OCI attestations.
+          sbom: true
+          provenance: mode=max
+
+      # Scans the exact digest just pushed (not a tag that could move). For a
+      # multi-arch index Trivy selects the runner's platform, so this covers
+      # linux/amd64; the arm64 image differs only in its platform wheels.
+      # exit-code 0: this step reports to the Security tab and does not gate —
+      # the image is already published by the time it runs.
+      # SHA-pinned (v0.36.0); a mutable tag is a supply-chain hole in a job that
+      # holds packages: write.
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.name.outputs.image }}@${{ steps.build.outputs.digest }}
+          format: sarif
+          output: trivy-results-${{ matrix.image }}.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          limit-severities-for-sarif: true
+          exit-code: "0"
+
+      - name: Upload Trivy results
+        if: ${{ !cancelled() && hashFiles('trivy-results-*.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-results-${{ matrix.image }}.sarif
+          category: trivy-${{ matrix.image }}

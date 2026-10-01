@@ -6,9 +6,12 @@
 .gitignore
 .venv
 venv/
-__pycache__/
-*.py[cod]
-*.egg-info/
+# `**/` so nested caches are excluded too: both Dockerfiles COPY `src` (and the
+# worker COPYs `migrations`) as whole directories, and a bare `__pycache__/`
+# only matches at the context root — stale host bytecode would ride along.
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
@@ -18,6 +21,12 @@ __pycache__/
 
 tests/
 docs/
+
+# Helm chart and other deploy-time material: consumed by the cluster, never
+# by an image. NOT excluded on purpose: uv.lock (both Dockerfiles install from
+# it), pyproject.toml, README.md (read by the build backend), src/,
+# migrations/ and alembic.ini (worker image).
+deploy/
 
 # Demo footage: fetched by scripts/fetch_demo_videos.py, mounted read-only
 # into the worker container at runtime — never baked into an image.
