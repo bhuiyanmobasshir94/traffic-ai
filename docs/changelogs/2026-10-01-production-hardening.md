@@ -94,3 +94,28 @@ the migrate hook against a live cluster, and the post-integration Postgres SQL p
 - Known gaps: worker `replicaCount>1` renders with a warning only; Docker socket mounted on
   Traefik; Traefik bearer token lives in a Middleware CR on K8s; snapshot rollups unused;
   cv2/tracker work is synchronous on the event loop; ultralytics AGPL decision still open.
+
+## Addendum — local deployment run (same day)
+
+The stack was built and run locally (Docker Desktop 20.10.23, 4-core arm64,
+`DOMAIN=traffic.localhost`, self-signed fallback cert). Full results are in
+`docs/DEPLOYMENT.md` → "What is and is not verified". Summary: images build from the
+lock; the production gate refuses unsafe config inside the real image; `migrate` applies
+0001 then no-ops on redeploy; edge BasicAuth (401/200), the Basic→bearer swap, the MJPEG
+stream through the login, worker-side bearer enforcement, the edge 429 limiter ahead of
+BasicAuth, readiness, metrics, and history surviving worker restarts were all observed.
+
+Two defects found and fixed:
+- **`pipeline_fps` was a single-tick reading** (`worker/pipeline.py`), reporting 12–35
+  while cameras processed ~0.5–1 frames/s. Now averaged over 20 ticks; live it read
+  0.99 against 128 frames in ~130 s. Test:
+  `test_reported_fps_is_the_sustained_rate_not_the_last_tick`.
+- **The worker CPU limit capped throughput** and its comment claimed headroom it did not
+  have (2 CPUs → ~0.5 fps/camera; 4 → ~0.9). Now `TRAFFIC_AI_WORKER_CPUS` (default 2.0).
+
+Found, **not fixed**: `toll-plaza-b` counts 0 and shows `standstill` on moving traffic —
+its counting line in `cameras.py` sits where the overpass occludes vehicles and the
+tracker churns IDs. Pre-existing camera configuration; it presents a false measurement
+and must be fixed before camera B is shown to a client.
+
+Verification after these fixes: `pytest` → 918 passed, 24 skipped; ruff clean.

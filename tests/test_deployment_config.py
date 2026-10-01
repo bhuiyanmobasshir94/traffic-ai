@@ -480,15 +480,23 @@ class TestResourceLimits:
     def test_reservations_never_exceed_limits(self, services: dict) -> None:
         for name, definition in services.items():
             resources = definition["deploy"]["resources"]
-            assert float(resources["reservations"]["cpus"]) <= float(resources["limits"]["cpus"])
+            # Limits may be `${VAR:-default}` (the worker's is); compare the defaults.
+            reserved = float(_interpolate(resources["reservations"]["cpus"], {}))
+            assert reserved <= float(_interpolate(resources["limits"]["cpus"], {})), name
             assert _memory_bytes(resources["reservations"]["memory"]) <= _memory_bytes(
                 resources["limits"]["memory"]
             ), name
 
     def test_worker_is_sized_for_cpu_inference(self, services: dict) -> None:
         limits = services["worker"]["deploy"]["resources"]["limits"]
-        assert float(limits["cpus"]) >= 2
+        assert float(_interpolate(limits["cpus"], {})) >= 2
         assert _memory_bytes(limits["memory"]) >= 3 * 1024**3
+
+    def test_worker_cpu_limit_is_operator_tunable(self, services: dict) -> None:
+        """Measured locally: the CPU limit directly caps processed fps (2 cpus ->
+        ~0.5 fps/camera, 4 -> ~0.9), so an operator must be able to raise it."""
+        cpus = services["worker"]["deploy"]["resources"]["limits"]["cpus"]
+        assert _interpolate(cpus, {"TRAFFIC_AI_WORKER_CPUS": "6"}) == "6"
 
     def test_redis_limit_leaves_headroom_over_its_dataset_cap(self, services: dict) -> None:
         # --maxmemory bounds the dataset only; the container needs room above it.

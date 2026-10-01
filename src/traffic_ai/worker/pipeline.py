@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from collections.abc import Callable
 
 import cv2
@@ -43,6 +44,10 @@ log = get_logger(__name__)
 
 _INITIAL_RETRY_BACKOFF_SECONDS = 5.0
 _MAX_RETRY_BACKOFF_SECONDS = 30.0
+
+
+# Ticks averaged by `CameraPipeline._measure_fps`; spans several detection ticks.
+_FPS_WINDOW_TICKS = 20
 
 
 class CameraPipeline:
@@ -83,7 +88,10 @@ class CameraPipeline:
 
         self._frame_index = 0
         self._last_detections: sv.Detections = sv.Detections.empty()
-        self._last_tick_monotonic: float | None = None
+        # Recent tick times for `_measure_fps`. A single-tick reading swings
+        # between fast tracker-only ticks and slow detection ticks, reporting
+        # e.g. 35 fps while the camera actually advances ~0.5 frames a second.
+        self._tick_times: deque[float] = deque(maxlen=_FPS_WINDOW_TICKS)
         self._stop_requested = False
         # A metric that raises would do so on every tick (~12/s); warn once, not per frame.
         self._metrics_failure_logged = False
@@ -342,15 +350,19 @@ class CameraPipeline:
                 log.warning("metrics_update_failed", camera_id=self.camera_id, error=str(exc))
 
     def _measure_fps(self) -> float:
-        now = time.monotonic()
-        if self._last_tick_monotonic is None:
-            self._last_tick_monotonic = now
+        """Frames actually processed per second, averaged over recent ticks.
+
+        Averaging across `_FPS_WINDOW_TICKS` spans several detection ticks, so the
+        figure is the sustained rate an operator can tune against rather than the
+        speed of whichever tick happened to publish last.
+        """
+        self._tick_times.append(time.monotonic())
+        if len(self._tick_times) < 2:
             return self._settings.target_fps
-        elapsed = now - self._last_tick_monotonic
-        self._last_tick_monotonic = now
-        if elapsed <= 0:
+        span = self._tick_times[-1] - self._tick_times[0]
+        if span <= 0:
             return self._settings.target_fps
-        return 1.0 / elapsed
+        return (len(self._tick_times) - 1) / span
 
     async def _publish_error(self, message: str) -> None:
         self._state = self._state.model_copy(

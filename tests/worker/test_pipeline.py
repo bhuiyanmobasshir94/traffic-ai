@@ -79,6 +79,28 @@ async def test_tick_publishes_a_camera_state_and_a_jpeg_frame(store, settings, c
     assert jpeg[:2] == _JPEG_MAGIC
 
 
+def test_reported_fps_is_the_sustained_rate_not_the_last_tick(
+    store, settings, camera, monkeypatch
+) -> None:
+    """Found running the stack locally: detection ticks took ~4s and tracker-only
+    ticks ~0.03s, so a one-tick reading swung between ~0.25 and ~35 fps and the
+    metric reported 35 while each camera really advanced ~0.5 frames a second."""
+    pipe = CameraPipeline(
+        camera, store, settings, detector=StubDetector(), tracker=ByteTrackTracker()
+    )
+    # Alternate slow detection ticks (3.97s) with fast tracker-only ticks (0.03s):
+    # 10 pairs = 20 ticks over 40s, i.e. a sustained 0.5 fps.
+    clock = iter([t for pair in range(10) for t in (pair * 4.0, pair * 4.0 + 0.03)] + [40.0, 40.03])
+    monkeypatch.setattr(pipeline_module.time, "monotonic", lambda: next(clock))
+
+    readings = [pipe._measure_fps() for _ in range(22)]
+
+    # Last tick was a fast one; a single-tick measure would report ~33 fps here.
+    # The 20-tick window then spans t=4.0..40.03: 19 intervals over 36.03s.
+    assert readings[-1] == pytest.approx(19 / 36.03, rel=0.01)
+    assert max(readings[2:]) < 2.0
+
+
 async def test_state_is_readable_before_any_tick(store, settings, camera) -> None:
     pipe = CameraPipeline(
         camera, store, settings, detector=StubDetector(), tracker=ByteTrackTracker()

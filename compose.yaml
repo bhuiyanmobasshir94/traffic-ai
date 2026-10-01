@@ -267,9 +267,13 @@ services:
     deploy:
       resources:
         limits:
-          # CPU inference is the dominant cost. Two streams at target_fps=12
-          # with detect_every_n_frames=2 keep roughly two cores busy.
-          cpus: "2.0"
+          # CPU inference is the dominant cost and this limit directly caps how
+          # many frames per second the pipelines process: measured locally,
+          # two torchvision streams saturate whatever they are given (2.0 cpus
+          # -> ~0.5 processed fps per camera). Give the worker every core the
+          # host can spare. Docker refuses a value above the host's core count,
+          # hence the conservative default.
+          cpus: "${TRAFFIC_AI_WORKER_CPUS:-2.0}"
           memory: 3G
         reservations:
           cpus: "1.0"

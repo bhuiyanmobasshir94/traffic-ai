@@ -86,6 +86,7 @@ closed on purpose:
 | `TRAFFIC_AI_TARGET_FPS` | `12` | The first knob to lower on a slow server |
 | `TRAFFIC_AI_DETECT_EVERY_N_FRAMES` | `2` | Raise to run detection less often |
 | `TRAFFIC_AI_FRAME_WIDTH` | `960` | Lower for faster detection |
+| `TRAFFIC_AI_WORKER_CPUS` | `2.0` | The worker container's CPU limit. Directly caps processed frames per second; set it to the cores the host can spare (must not exceed the host's core count) |
 | `TRAFFIC_AI_DEVICE` | `cpu` | |
 | `TRAFFIC_AI_MODEL_WEIGHTS` | `/app/weights/yolov8n.pt` | |
 | `TRAFFIC_AI_LOG_LEVEL` | `INFO` | |
@@ -550,6 +551,16 @@ constrained server, tune these in `.env` (all in `traffic_ai.config`):
 - **`TRAFFIC_AI_FRAME_WIDTH`**: detection runs on frames downscaled to this width.
   Smaller frames are proportionally faster.
 
+- **`TRAFFIC_AI_WORKER_CPUS`**: the worker's container CPU limit. Measured on a
+  4-core arm64 laptop (2026-10-01, default torchvision detector, both cameras): the
+  worker saturates whatever it is given — 2 CPUs gave **~0.5 processed frames/s per
+  camera**, 4 CPUs **~0.9**. The footage is 30 fps, so the annotated stream advances
+  in slow motion and wall-clock throughput (`throughput_per_min`) reads far below the
+  footage's real flow. Give the worker every core you can.
+
+`pipeline_fps` (state, overlay, and the `pipeline_fps` metric) is averaged over the
+last 20 ticks; it is the sustained processed rate, so read it after tuning.
+
 Start by lowering `TRAFFIC_AI_TARGET_FPS`; it has the largest effect per unit of
 quality lost. `docker stats` shows live CPU and memory per container while tuning.
 If a container is being killed for memory (`docker inspect <container>` shows
@@ -795,13 +806,32 @@ workflows were parsed and checked with `actionlint`; the pinned action SHAs were
 looked up through the GitHub API on 2026-10-01. The cited `config.py`, route, and
 middleware behavior was read from the code.
 
-**Not verified, because no Docker daemon was available:** building the images; the
-`migrate` service actually running `alembic upgrade head` against Postgres, and
-`docker compose up` re-running it on upgrade; Traefik loading the users file and
-enforcing BasicAuth; the header swap on the worker router; **the rate-limit
-middleware itself** (that Traefik accepts these labels, answers `429`, runs it before
-BasicAuth, and keys on the peer address at `depth=0`); the effect of the stop grace
-periods on a real `docker compose stop`; bcrypt cost 12's CPU effect on Traefik; the
+**Verified by a local deployment (2026-10-01, Docker Desktop 20.10.23, 4-core arm64,
+`DOMAIN=traffic.localhost`, Traefik's self-signed fallback certificate):** both images
+build from `uv.lock` (worker 1.71 GB; UI 596 MB with no torch, cv2, ultralytics, or
+SQLAlchemy); the worker image refuses `TRAFFIC_AI_ENVIRONMENT=production` with no token
+and the dev DB password, naming both; `docker compose up -d` brings every service to
+healthy, `migrate` applies revision `0001` and exits 0 before the worker starts, and only
+Traefik publishes ports. At the edge: no credentials and a wrong password → 401, the
+right login → 200, HTTP → 301 to HTTPS; with only the login, `/api/cameras` → 200, which
+proves the BasicAuth→bearer swap; the MJPEG stream plays through the login (6 frames,
+454 KB in 6 s, HSTS, nosniff, `X-Frame-Options`, `X-Request-ID` present) and is 401
+without it. Inside the network the worker itself returns 401 for no or a wrong bearer and
+200 for the right one, keeps `/api/healthz` open, and guards `/api/metrics`. A 40-way
+parallel burst of 200 unauthenticated requests returned 128 × 429 and 72 × 401, so the
+edge limiter runs before BasicAuth. `/api/readyz` reported `database: true`,
+`history_events_lost: 0`; live crossings matched `/api/history/counts` and
+`crossings_total`; history survived a worker restart while the live counters reset.
+
+**Found by the local deployment, not fixed here:** `toll-plaza-b` counts **0** crossings
+and reports `standstill` on visibly moving traffic. Its counting line sits at the
+overpass edge where vehicles are occluded, and the tracker churns IDs (48–55 active
+tracks, IDs above 480 within ~150 frames), so no vehicle is seen crossing. This is
+camera configuration in `src/traffic_ai/cameras.py` that predates this branch, and the
+dashboard presents it as a real measurement — fix before showing camera B to a client.
+
+**Not verified:** the effect of the stop grace periods on a real `docker compose stop`;
+bcrypt cost 12's CPU effect on Traefik; the
 missing-file error message from `create_host_path: false`; Let's Encrypt issuance, and
 BasicAuth not interfering with it; the password-reset path (that `psql` over the
 container's local socket is trusted); the backup, restore, and password-reset
