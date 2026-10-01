@@ -5,6 +5,8 @@ Everything on the page is read from the API's `/history/*` endpoints through
 distinct on purpose, because each means something different to the person
 looking at the screen:
 
+- `NOT_CALIBRATED` — the API answered 409: counting is off for that camera, so it has no
+                   history at all. Not a measured zero, and not a fault.
 - `OK`           — there is history to show.
 - `EMPTY`        — history works and the window genuinely holds no crossings.
                    A real, measured zero, not a failure.
@@ -30,6 +32,7 @@ from traffic_ai.cameras import CAMERAS, get_camera
 from traffic_ai.domain import VEHICLE_CLASSES, CrossingEvent, Direction
 from traffic_ai.ui.client import (
     ApiUnauthorized,
+    CountingNotCalibrated,
     HistoryCounts,
     HistoryHourly,
     HistoryUnavailable,
@@ -37,7 +40,12 @@ from traffic_ai.ui.client import (
     WorkerUnavailable,
     get_worker_client,
 )
-from traffic_ai.ui.components import build_event_rows, render_demo_footage_notice, render_sidebar
+from traffic_ai.ui.components import (
+    build_event_rows,
+    counting_disabled_reason,
+    render_demo_footage_notice,
+    render_sidebar,
+)
 
 ALL_CAMERAS = "All cameras"
 
@@ -60,6 +68,7 @@ class HistoryStatus(StrEnum):
     EMPTY = "empty"
     UNAUTHORIZED = "unauthorized"
     UNAVAILABLE = "unavailable"
+    NOT_CALIBRATED = "not_calibrated"
     ERROR = "error"
 
 
@@ -103,6 +112,11 @@ def resolve_camera(choice: object) -> str | None:
         return None
     camera = get_camera(choice)
     return camera.camera_id if camera is not None else None
+
+
+def uncalibrated_camera_names() -> list[str]:
+    """Display names of cameras whose counting is switched off, in registry order."""
+    return [camera.name for camera in CAMERAS if not camera.counting_enabled]
 
 
 def window_bounds(label: object, *, now: datetime) -> tuple[datetime, datetime]:
@@ -165,6 +179,8 @@ def fetch_history(
         return HistoryView(HistoryStatus.UNAUTHORIZED, message=str(exc))
     except HistoryUnavailable as exc:
         return HistoryView(HistoryStatus.UNAVAILABLE, message=str(exc))
+    except CountingNotCalibrated as exc:
+        return HistoryView(HistoryStatus.NOT_CALIBRATED, message=str(exc))
     except WorkerUnavailable as exc:
         return HistoryView(HistoryStatus.ERROR, message=str(exc))
 
@@ -192,6 +208,9 @@ def render_history(view: HistoryView) -> None:
     if view.status is HistoryStatus.UNAVAILABLE:
         st.warning(view.message)
         st.caption("Live counts on the dashboard pages are not affected.")
+        return
+    if view.status is HistoryStatus.NOT_CALIBRATED:
+        st.info(view.message)
         return
     if view.status is HistoryStatus.ERROR:
         st.error(f"Could not load history. {view.message}")
@@ -252,10 +271,25 @@ def render_analytics(*, page_key: str, title: str) -> None:
     )
     window_choice = window_col.selectbox("Window", options=list(WINDOWS), key=window_key)
 
+    camera_id = resolve_camera(camera_choice)
+    # An uncalibrated camera records no crossings. History is not queried for it: an empty
+    # result would read as a measured "none", which is the thing being avoided.
+    reason = counting_disabled_reason(camera_id) if camera_id is not None else None
+    if reason is not None:
+        st.info(reason)
+        return
+
     since, until = window_bounds(window_choice, now=datetime.now(UTC))
     st.caption(f"{since:%Y-%m-%d %H:%M} to {until:%Y-%m-%d %H:%M} UTC")
+    if camera_id is None:
+        excluded = uncalibrated_camera_names()
+        if excluded:
+            # Says what the worker does, not what the database holds: these totals are
+            # whatever the history endpoints return, and they are not filtered by camera.
+            st.caption(
+                f"Counting is off for {', '.join(excluded)} (not calibrated), "
+                "so no crossings are recorded for it."
+            )
 
-    view = fetch_history(
-        get_worker_client(), camera_id=resolve_camera(camera_choice), since=since, until=until
-    )
+    view = fetch_history(get_worker_client(), camera_id=camera_id, since=since, until=until)
     render_history(view)

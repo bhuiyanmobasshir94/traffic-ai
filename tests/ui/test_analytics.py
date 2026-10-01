@@ -16,7 +16,7 @@ import httpx
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from traffic_ai.cameras import CAMERAS
+from traffic_ai.cameras import CAMERAS, DEFAULT_COUNTING_DISABLED_REASON
 from traffic_ai.domain import CrossingEvent, Direction
 from traffic_ai.ui import analytics
 from traffic_ai.ui.analytics import (
@@ -461,14 +461,16 @@ def test_all_cameras_sends_no_camera_filter_and_a_selected_camera_does(
     assert all("camera_id" not in r.url.params for r in requests)
 
     requests.clear()
-    at.selectbox(key="analytics:camera").select(CAMERAS[1].camera_id).run(timeout=15)
+    # Camera A, not B: B is not calibrated for counting, so the page deliberately does not
+    # query history for it (see the "uncalibrated camera" tests below).
+    at.selectbox(key="analytics:camera").select(CAMERAS[0].camera_id).run(timeout=15)
 
     assert len(at.exception) == 0
     # The readiness lookup behind the "totals may be incomplete" warning is not a history
     # query and carries no camera filter, so only the `/history/*` requests are checked.
     history = [r for r in requests if r.url.path.startswith("/api/history/")]
     assert history
-    assert {r.url.params["camera_id"] for r in history} == {CAMERAS[1].camera_id}
+    assert {r.url.params["camera_id"] for r in history} == {CAMERAS[0].camera_id}
 
 
 def test_window_selector_changes_the_requested_range(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -598,3 +600,119 @@ def test_the_disclosure_is_shown_even_when_history_is_unavailable(
     at = _run()
 
     assert any("looped" in c.value for c in at.caption)
+
+
+# --- an uncalibrated camera has no history to show -------------------------------------
+#
+# Camera B's counting is switched off (`CameraConfig.counting_enabled`). It records no
+# crossings, so an empty history for it would read as a measured "none".
+
+_UNCALIBRATED = next(c for c in CAMERAS if not c.counting_enabled)
+_CALIBRATED = next(c for c in CAMERAS if c.counting_enabled)
+
+
+def test_uncalibrated_camera_names_lists_only_cameras_with_counting_off() -> None:
+    assert analytics.uncalibrated_camera_names() == [_UNCALIBRATED.name]
+
+
+def test_page_shows_the_reason_and_queries_no_history_for_an_uncalibrated_camera(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests = _install(monkeypatch, _healthy_handler)
+    at = _run()
+    requests.clear()
+
+    at.selectbox(key="analytics:camera").select(_UNCALIBRATED.camera_id).run(timeout=15)
+
+    assert len(at.exception) == 0
+    assert [i.value for i in at.info] == [_UNCALIBRATED.counting_disabled_reason]
+    # No request of any kind: not the history queries, and not the readiness lookup.
+    assert [r.url.path for r in requests] == []
+    # Nothing that looks like a measurement is rendered.
+    assert len(at.metric) == 0
+    assert len(at.dataframe) == 0
+    assert len(at.get("vega_lite_chart")) == 0
+    assert len(at.error) == 0
+    assert len(at.warning) == 0
+
+
+def test_the_uncalibrated_reason_replaces_history_even_when_history_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reason is decided from the registry before the API is asked anything, so a
+    503 cannot turn into a warning about a history that was never going to exist."""
+    _install(monkeypatch, lambda request: httpx.Response(503, json={"detail": "off"}))
+    at = _run()
+
+    at.selectbox(key="analytics:camera").select(_UNCALIBRATED.camera_id).run(timeout=15)
+
+    assert [i.value for i in at.info] == [_UNCALIBRATED.counting_disabled_reason]
+    assert len(at.warning) == 0
+
+
+def test_all_cameras_says_counting_is_off_for_the_uncalibrated_camera(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install(monkeypatch, _healthy_handler)
+    at = _run()
+
+    notes = [c.value for c in at.caption if "Counting is off for" in c.value]
+    assert len(notes) == 1
+    assert _UNCALIBRATED.name in notes[0]
+    assert "not calibrated" in notes[0]
+    assert "no crossings are recorded" in notes[0]
+    assert _CALIBRATED.name not in notes[0]
+    # It states what the worker does, not what the database holds: the totals are the
+    # history endpoints' unfiltered sums, so nothing here may claim a camera is excluded.
+    assert not any(word in notes[0].lower() for word in ("excluded", "not included"))
+    # The totals themselves are untouched.
+    assert [m.value for m in at.metric] == ["27", "16", "11"]
+
+
+def test_a_calibrated_camera_has_no_exclusion_note_and_still_queries_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests = _install(monkeypatch, _healthy_handler)
+    at = _run()
+    requests.clear()
+
+    at.selectbox(key="analytics:camera").select(_CALIBRATED.camera_id).run(timeout=15)
+
+    assert not any("Counting is off" in c.value for c in at.caption)
+    assert [m.label for m in at.metric] == ["Total crossings", "Incoming", "Outgoing"]
+    assert any(r.url.path == "/api/history/counts" for r in requests)
+
+
+def _worker_says_not_calibrated(request: httpx.Request) -> httpx.Response:
+    """The API's 409 on every history route, whatever the UI's own registry thinks."""
+    if request.url.path.startswith("/api/history/"):
+        return httpx.Response(409, json={"detail": "counting is not calibrated"})
+    return _healthy_handler(request)
+
+
+def test_fetch_history_maps_a_409_to_not_calibrated_not_to_an_error() -> None:
+    view = _fetch(_client(_worker_says_not_calibrated))
+
+    assert view.status is HistoryStatus.NOT_CALIBRATED
+    assert view.message == DEFAULT_COUNTING_DISABLED_REASON
+    assert view.counts is None
+    assert view.hourly is None
+    assert view.events == ()
+
+
+def test_page_shows_the_not_calibrated_message_when_the_worker_answers_409(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defence in depth: the registry check does not fire for "All cameras", so a 409 from
+    the worker (a UI older than the worker, say) is what reaches the page. It must read as
+    "not calibrated" -- not as a load failure, and not as an empty window."""
+    _install(monkeypatch, _worker_says_not_calibrated)
+    at = _run()
+
+    assert len(at.exception) == 0
+    assert [i.value for i in at.info] == [DEFAULT_COUNTING_DISABLED_REASON]
+    assert len(at.error) == 0
+    assert len(at.warning) == 0
+    assert len(at.metric) == 0
+    assert len(at.dataframe) == 0
+    assert not any("No crossings recorded" in i.value for i in at.info)

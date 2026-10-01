@@ -12,7 +12,7 @@ from typing import Annotated, NamedTuple, Protocol
 
 from fastapi import HTTPException, Query, Request
 
-from traffic_ai.cameras import CameraConfig, get_camera
+from traffic_ai.cameras import DEFAULT_COUNTING_DISABLED_REASON, CameraConfig, get_camera
 from traffic_ai.config import Settings
 from traffic_ai.domain import CrossingEvent
 from traffic_ai.store import StateStore
@@ -45,6 +45,32 @@ def get_camera_or_404(camera_id: str) -> CameraConfig:
     if camera is None:
         raise HTTPException(status_code=404, detail=f"unknown camera: {camera_id}")
     return camera
+
+
+def _require_counting(camera: CameraConfig) -> CameraConfig:
+    """409 for a camera whose counting is switched off, carrying its reason.
+
+    The crossing data an endpoint would serve for such a camera is not a measurement, so
+    the endpoint refuses rather than answering with an empty list or zeros that read as
+    "no traffic". 409, not 404: the camera exists and its live state, frame and stream are
+    served; it is this one resource that is in a state that cannot answer.
+    """
+    if not camera.counting_enabled:
+        raise HTTPException(
+            status_code=409,
+            detail=camera.counting_disabled_reason or DEFAULT_COUNTING_DISABLED_REASON,
+        )
+    return camera
+
+
+def get_counting_camera_or_409(camera_id: str) -> CameraConfig:
+    """`get_camera_or_404`, then 409 if the camera is not calibrated for counting.
+
+    For the per-camera routes that serve crossings. The live state, frame and stream use
+    `get_camera_or_404` alone: video and `active_tracks` are real for an uncalibrated
+    camera. Unknown is answered 404 before calibration is considered.
+    """
+    return _require_counting(get_camera_or_404(camera_id))
 
 
 # --- history ----------------------------------------------------------------
@@ -80,11 +106,15 @@ def get_history_camera_id(camera_id: Annotated[str | None, Query()] = None) -> s
     Returns the registry's own id rather than echoing the request value, so what
     reaches a query is never the caller's string. Absent means "every camera"; a
     present-but-unknown value (an empty string included) is a 404, not a silent
-    widening to all cameras.
+    widening to all cameras. A camera whose counting is switched off is a 409 with its
+    reason: it records no crossings, so an empty history for it would read as measured.
+
+    This is the first dependency on every history route, so camera errors (404, then 409)
+    are answered before a window error (422) and before availability (503).
     """
     if camera_id is None:
         return None
-    return get_camera_or_404(camera_id).camera_id
+    return get_counting_camera_or_409(camera_id).camera_id
 
 
 def get_history_window(

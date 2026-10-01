@@ -104,6 +104,11 @@ class CameraState(BaseModel):
     anpr_enabled: bool = False
     error: str | None = None
 
+    # False means this camera is not calibrated for counting: `counts`,
+    # `throughput_per_min` and `congestion` are then unmeasured defaults and must not be
+    # shown as measurements (`active_tracks` and the live video are still real).
+    counting_enabled: bool = True
+
     @property
     def total_counted(self) -> int:
         return sum(c.total for c in self.counts.values())

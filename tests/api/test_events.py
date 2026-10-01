@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from traffic_ai.api import routes as routes_module
 from traffic_ai.cameras import CAMERAS
 from traffic_ai.domain import CrossingEvent, Direction
 
@@ -21,8 +23,16 @@ def _event(camera_id: str, track_id: int, *, seconds_ago: float) -> CrossingEven
     )
 
 
-async def test_events_merged_newest_first(app_factory, running_app, store) -> None:
+async def test_events_merged_newest_first(app_factory, running_app, store, monkeypatch) -> None:
     camera_a, camera_b = CAMERAS[0].camera_id, CAMERAS[1].camera_id
+    # The registry's camera B is not calibrated for counting, so the real feed leaves it out
+    # (`test_counting_gate.py`). Merging is still what is under test here: put it back as a
+    # counting camera for this test only, so the feed really has two cameras to merge.
+    monkeypatch.setattr(
+        routes_module,
+        "CAMERAS",
+        (CAMERAS[0], dataclasses.replace(CAMERAS[1], counting_enabled=True)),
+    )
     oldest = _event(camera_a, 1, seconds_ago=30)
     middle = _event(camera_b, 2, seconds_ago=20)
     newest = _event(camera_a, 3, seconds_ago=5)

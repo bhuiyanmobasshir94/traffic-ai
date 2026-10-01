@@ -823,12 +823,38 @@ edge limiter runs before BasicAuth. `/api/readyz` reported `database: true`,
 `history_events_lost: 0`; live crossings matched `/api/history/counts` and
 `crossings_total`; history survived a worker restart while the live counters reset.
 
-**Found by the local deployment, not fixed here:** `toll-plaza-b` counts **0** crossings
-and reports `standstill` on visibly moving traffic. Its counting line sits at the
-overpass edge where vehicles are occluded, and the tracker churns IDs (48–55 active
-tracks, IDs above 480 within ~150 frames), so no vehicle is seen crossing. This is
-camera configuration in `src/traffic_ai/cameras.py` that predates this branch, and the
-dashboard presents it as a real measurement — fix before showing camera B to a client.
+**Found by the local deployment, then contained rather than fixed (branch
+`production-hardening`, 2026-10-01):** `toll-plaza-b` counted **0** crossings and
+reported `standstill` on visibly moving traffic, and the dashboard presented both as
+measurements. The tracker churns IDs on that footage (48–55 active tracks, IDs above 480
+within ~150 frames). A follow-up measurement over 900 frames of `toll-plaza-b.mp4`, with
+the real torchvision detector and ByteTrack, gave 3,932 track IDs for a scene of about 50
+vehicles (median track life 3–13 frames). Scoring every horizontal counting line from
+y=0.40 to y=0.95 with the real `LineCounter` gave 0 to 540 crossings for the same 30 s,
+and gating on track age moved that to 6–530, against roughly 20–30 real incoming vehicles
+in a slit-scan of the footage. No line placement is correct, so any count from this camera
+would be invented. (These figures come from that investigation and were not re-run when the
+switch below was added.)
+
+`toll-plaza-b` is therefore configured `counting_enabled=False` in
+`src/traffic_ai/cameras.py`. It still decodes, detects, tracks and streams annotated live
+video, and still reports `active_tracks`. It does not count, derive throughput or
+congestion, write to history, or increment `crossings_total`; the overlay reads "counting
+not calibrated"; its map marker and corridor are gray; the dashboard shows the reason in
+place of the metrics; and the Analytics page shows the reason instead of querying history.
+The API answers **409**, with that reason as `detail`, on
+`/api/cameras/toll-plaza-b/events` and on `/api/history/{events,counts,hourly}` when
+`camera_id=toll-plaza-b`; the merged `/api/events` feed leaves it out. Its `/state`,
+`frame.jpg` and `stream.mjpg` still answer 200. Order of answers: unknown camera 404, then
+409, then a bad window or `limit` 422, then history unavailable 503. `toll-plaza-a` is
+unchanged. This hides the problem and does not fix tracking on that
+footage: turning counting back on needs footage or a tracker that holds identities, plus a
+re-measurement, not a different line. The switch is covered by unit tests; it has not been
+run against the deployed stack. Crossing rows for camera B written before the switch (the
+local run above counted 0 for it) are not removed. The 409 is decided by the `camera_id` the
+caller names, so `/api/history/*` without a `camera_id` (and the Analytics "All cameras"
+view built on it) would still include such rows: the aggregates are SQL sums the API cannot
+take one camera out of without a change to the repository.
 
 **Not verified:** the effect of the stop grace periods on a real `docker compose stop`;
 bcrypt cost 12's CPU effect on Traefik; the

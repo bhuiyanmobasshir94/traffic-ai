@@ -20,6 +20,7 @@ from streamlit_folium import st_folium
 from traffic_ai.cameras import (
     CAMERAS,
     CAMERAS_BY_ID,
+    DEFAULT_COUNTING_DISABLED_REASON,
     MAP_CENTER,
     MAP_ZOOM,
     ROAD_SEGMENTS,
@@ -42,6 +43,32 @@ from traffic_ai.domain import (
 _LOGO_PATH = Path(__file__).resolve().parents[3] / "logo.png"
 
 _FALLBACK_COLOR = "gray"
+
+
+def counting_disabled_reason(camera_id: str, state: CameraState | None = None) -> str | None:
+    """Why this camera's counts, throughput and congestion must not be shown, or `None`
+    when they may be.
+
+    Fails closed: either the registry (`CameraConfig.counting_enabled`) or the state the
+    worker published (`CameraState.counting_enabled`) saying "off" is enough, so a stale
+    or older state cannot turn an uncalibrated camera's numbers back on. `camera_id` is
+    resolved through `get_camera`; an unknown id has no registry opinion.
+    """
+    camera = get_camera(camera_id)
+    registry_off = camera is not None and not camera.counting_enabled
+    published_off = state is not None and not state.counting_enabled
+    if not (registry_off or published_off):
+        return None
+    reason = camera.counting_disabled_reason if camera is not None else ""
+    return reason or DEFAULT_COUNTING_DISABLED_REASON
+
+
+def _corridor_color(camera_id: str, state: CameraState | None) -> str:
+    """Map colour for a camera's marker/corridor: its live congestion level, or the
+    neutral fallback when there is no state or congestion is not a measurement."""
+    if state is None or counting_disabled_reason(camera_id, state) is not None:
+        return _FALLBACK_COLOR
+    return state.congestion.map_color
 
 
 def render_sidebar() -> None:
@@ -101,7 +128,8 @@ def render_live_video(camera_id: str, public_base_url: str) -> None:
 
 def render_map(states: dict[str, CameraState], *, key: str = "traffic-map") -> dict[str, Any]:
     """Folium map: one marker per camera, one polyline per road segment,
-    each coloured from that segment's/camera's live `CongestionLevel`.
+    each coloured from that segment's/camera's live `CongestionLevel` -- or neutral
+    gray when there is no state or the camera is not calibrated for counting.
 
     `key` namespaces the underlying component instance so the toll-booth and
     traffic-analysis pages, which both call this, do not share one widget.
@@ -112,8 +140,7 @@ def render_map(states: dict[str, CameraState], *, key: str = "traffic-map") -> d
     m = folium.Map(location=MAP_CENTER, zoom_start=MAP_ZOOM)
 
     for camera in CAMERAS:
-        state = states.get(camera.camera_id)
-        color = state.congestion.map_color if state is not None else _FALLBACK_COLOR
+        color = _corridor_color(camera.camera_id, states.get(camera.camera_id))
         folium.Marker(
             [camera.latitude, camera.longitude],
             # The popup carries the camera_id, not the display name, so a
@@ -125,8 +152,7 @@ def render_map(states: dict[str, CameraState], *, key: str = "traffic-map") -> d
         ).add_to(m)
 
     for segment in ROAD_SEGMENTS:
-        state = states.get(segment.camera_id)
-        color = state.congestion.map_color if state is not None else _FALLBACK_COLOR
+        color = _corridor_color(segment.camera_id, states.get(segment.camera_id))
         folium.PolyLine(segment.path, color=color, weight=10, tooltip=segment.name).add_to(m)
 
     return st_folium(m, use_container_width=True, height=320, key=key)
@@ -157,6 +183,15 @@ def render_stats(state: CameraState | None) -> None:
                 hide_index=True,
                 use_container_width=True,
             )
+
+
+def render_counting_disabled(reason: str, state: CameraState | None) -> None:
+    """Stands in for `render_stats` on an uncalibrated camera: the reason, and only the
+    values that are still real. Counts, throughput and congestion are not rendered.
+    `reason` is plain text from the camera registry, passed to `st.info` (no HTML)."""
+    st.info(reason)
+    if state is not None:
+        st.metric("Active tracks", state.active_tracks)
 
 
 def build_event_rows(

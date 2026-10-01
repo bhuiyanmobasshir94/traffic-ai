@@ -20,6 +20,7 @@ from traffic_ai.api.dependencies import (
     HistoryReader,
     HistoryWindow,
     get_camera_or_404,
+    get_counting_camera_or_409,
     get_history_camera_id,
     get_history_reader,
     get_history_window,
@@ -67,9 +68,17 @@ _HISTORY_QUERY_TIMEOUT_SECONDS = 4.0
 SettingsDep = Annotated[Settings, Depends(get_settings_dep)]
 StoreDep = Annotated[StateStore, Depends(get_store_dep)]
 CameraDep = Annotated[CameraConfig, Depends(get_camera_or_404)]
+# For routes that serve crossings: also 409s a camera whose counting is switched off.
+CountingCameraDep = Annotated[CameraConfig, Depends(get_counting_camera_or_409)]
 HistoryCameraDep = Annotated[str | None, Depends(get_history_camera_id)]
 HistoryWindowDep = Annotated[HistoryWindow, Depends(get_history_window)]
 HistoryDep = Annotated[HistoryReader, Depends(get_history_reader)]
+
+# OpenAPI only: the 409 itself is raised by `get_counting_camera_or_409` (`detail` is the
+# camera's own `counting_disabled_reason`).
+_NOT_CALIBRATED_RESPONSE: dict[int | str, dict[str, str]] = {
+    409: {"description": "Counting is not calibrated for this camera; `detail` says why."}
+}
 
 
 @router.get("/healthz", response_model=HealthResponse)
@@ -226,12 +235,17 @@ async def camera_stream(
     return StreamingResponse(frames, media_type="multipart/x-mixed-replace; boundary=frame")
 
 
-@router.get("/cameras/{camera_id}/events", response_model=list[CrossingEvent])
+@router.get(
+    "/cameras/{camera_id}/events",
+    response_model=list[CrossingEvent],
+    responses=_NOT_CALIBRATED_RESPONSE,
+)
 async def camera_events(
-    camera: CameraDep,
+    camera: CountingCameraDep,
     store: StoreDep,
     limit: int = Query(default=50, ge=1, le=200),
 ) -> list[CrossingEvent]:
+    """Recent crossings for one camera. 409 (with the reason) if its counting is off."""
     return await store.read_events(camera.camera_id, limit)
 
 
@@ -240,8 +254,13 @@ async def all_events(
     store: StoreDep,
     limit: int = Query(default=50, ge=1, le=200),
 ) -> list[CrossingEvent]:
-    """Merged, newest-first feed across every registered camera."""
-    camera_ids = [c.camera_id for c in CAMERAS]
+    """Merged, newest-first feed across every camera that counts.
+
+    A camera with counting switched off is not read at all, rather than filtered
+    afterwards: its Redis events can outlive the switch by up to the state TTL, and
+    filtering after the `limit` would also return fewer rows than were asked for.
+    """
+    camera_ids = [c.camera_id for c in CAMERAS if c.counting_enabled]
     return await store.read_events_multi(camera_ids, limit)
 
 
@@ -278,7 +297,11 @@ async def _history_query[T](query: Awaitable[T]) -> T:
         ) from None
 
 
-@router.get("/history/events", response_model=list[CrossingEvent])
+@router.get(
+    "/history/events",
+    response_model=list[CrossingEvent],
+    responses=_NOT_CALIBRATED_RESPONSE,
+)
 async def history_events(
     camera_id: HistoryCameraDep,
     reader: HistoryDep,
@@ -288,7 +311,7 @@ async def history_events(
     return await _history_query(reader.recent(camera_id, limit))
 
 
-@router.get("/history/counts", response_model=HistoryCounts)
+@router.get("/history/counts", response_model=HistoryCounts, responses=_NOT_CALIBRATED_RESPONSE)
 async def history_counts(
     camera_id: HistoryCameraDep, window: HistoryWindowDep, reader: HistoryDep
 ) -> HistoryCounts:
@@ -304,7 +327,7 @@ async def history_counts(
     )
 
 
-@router.get("/history/hourly", response_model=HourlyTotals)
+@router.get("/history/hourly", response_model=HourlyTotals, responses=_NOT_CALIBRATED_RESPONSE)
 async def history_hourly(
     camera_id: HistoryCameraDep, window: HistoryWindowDep, reader: HistoryDep
 ) -> HourlyTotals:

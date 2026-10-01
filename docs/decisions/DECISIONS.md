@@ -339,3 +339,28 @@ CPU index in the lock makes the "operator torchvision::nms does not exist" misma
 rather than merely documented.
 
 **Rules out.** Poetry; installing torch outside the lock; `latest` tags on pre-releases.
+
+---
+
+## 2026-10-01 — Uncalibrated cameras are contained, not guessed: Toll Plaza B stops counting
+
+**Decision.** `CameraConfig.counting_enabled` (default `True`) gates counting per camera; Toll
+Plaza B is `False`. A disabled camera still decodes, detects, tracks, annotates, and streams
+(live video and active tracks are real), but never runs the line counter, records crossings,
+writes history, or derives throughput/congestion. The overlay says "counting not calibrated",
+the map draws it grey, the dashboard and Analytics show the reason, and the API returns 409 for
+its history and events.
+
+**Why.** Running the real detector and tracker over 900 frames of `toll-plaza-b.mp4` gave 3,932
+track IDs for a scene of ~50 vehicles; every horizontal line y=0.40–0.95 produced 0–540
+crossings for the same 30 s, and track-age gating 6–530, against roughly 20–30 real incoming
+vehicles seen in a slit-scan. No line placement is correct, so any number would be fabricated.
+
+**Rules out / rejected.** Moving the line (measured: no position is right); gating on track age
+(moves the error, does not remove it); shipping a "best guess" line. Re-enabling B requires
+fixing tracking (tracker tuning, a different detector, or different footage) and validating
+against a hand count first. **Known contract tradeoff:** B's `CameraState` keeps model defaults
+(`congestion: free_flow`, zero counts) beside `counting_enabled: false`, because nullable fields
+would break the worker↔UI contract. Acceptable only while the bundled UI is the sole consumer of
+`/api/cameras/{id}/state`; any other consumer must read `counting_enabled` first. Roll the UI
+out before or with the worker, since an older UI ignores the flag.

@@ -8,6 +8,7 @@ deliberately nonexistent `video_dir`.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from pathlib import Path
 
 import numpy as np
@@ -16,8 +17,10 @@ import structlog
 import supervision as sv
 
 from traffic_ai import metrics
-from traffic_ai.domain import CrossingEvent, Direction, PipelineStatus
+from traffic_ai.cameras import CameraConfig
+from traffic_ai.domain import CongestionLevel, CrossingEvent, Direction, PipelineStatus
 from traffic_ai.worker import pipeline as pipeline_module
+from traffic_ai.worker.counting import LineCounter
 from traffic_ai.worker.detection import StubDetector
 from traffic_ai.worker.pipeline import CameraPipeline, build_pipelines
 from traffic_ai.worker.tracking import ByteTrackTracker
@@ -459,3 +462,137 @@ async def test_build_pipelines_shares_one_writer_across_cameras(store, settings)
 
     assert all(p._writer is writer for p in shared)
     assert all(p._writer is None for p in default)
+
+
+# --- a camera with counting switched off ---------------------------------------------
+#
+# `CameraConfig.counting_enabled=False` (camera B): live video and `active_tracks` stay,
+# but nothing is counted, recorded, exported, or derived from crossings. The scripted
+# `_CrossingTracker` carries two vehicles across the counting line on the second tick,
+# which is exactly what would be counted if the pipeline were counting.
+
+_UNCALIBRATED_ID = "uncalibrated-test-camera"
+
+
+def _uncalibrated(camera: CameraConfig) -> CameraConfig:
+    # A distinct id keeps the process-global `crossings_total` series for this camera at
+    # zero, so "never incremented" is not confounded by another test's counts.
+    return dataclasses.replace(
+        camera,
+        camera_id=_UNCALIBRATED_ID,
+        counting_enabled=False,
+        counting_disabled_reason="not calibrated (test)",
+    )
+
+
+def _crossings_exported_for(camera_id: str) -> float:
+    return sum(
+        sample.value
+        for family in metrics.registry.collect()
+        for sample in family.samples
+        if sample.name == "crossings_total" and sample.labels.get("camera_id") == camera_id
+    )
+
+
+class _SpyLineCounter(LineCounter):
+    """The real counter, recording that one was built."""
+
+    built = 0
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        type(self).built += 1
+        super().__init__(*args, **kwargs)
+
+
+@pytest.fixture
+def spies(monkeypatch):
+    """Spy on the two counting-derived steps; reset per test."""
+    _SpyLineCounter.built = 0
+    congestion_calls: list[dict[str, object]] = []
+    real_derive = pipeline_module.derive_congestion
+
+    def derive(**kwargs):
+        congestion_calls.append(kwargs)
+        return real_derive(**kwargs)
+
+    monkeypatch.setattr(pipeline_module, "LineCounter", _SpyLineCounter)
+    monkeypatch.setattr(pipeline_module, "derive_congestion", derive)
+    return congestion_calls
+
+
+async def test_an_uncalibrated_camera_never_counts_records_or_derives_congestion(
+    store, settings, camera, spies
+) -> None:
+    writer = _RecordingWriter()
+    uncalibrated = _uncalibrated(camera)
+    pipe = _crossing_pipeline(store, settings, uncalibrated, writer=writer)
+
+    for _ in range(3):  # tick 2 moves both tracked vehicles across the line position
+        await pipe._process_frame(_frame())
+
+    # Nothing counted, recorded, or exported.
+    assert _SpyLineCounter.built == 0
+    assert pipe._line_counter is None
+    assert writer.events == []
+    assert await store.read_events(uncalibrated.camera_id, 10) == []
+    assert _crossings_exported_for(uncalibrated.camera_id) == 0.0
+    assert spies == []  # congestion was never derived from throughput
+
+    # Live state is still published, flagged, with the counting fields at their defaults.
+    for state in (pipe.state, await store.read_state(uncalibrated.camera_id)):
+        assert state is not None
+        assert state.counting_enabled is False
+        assert state.status is PipelineStatus.RUNNING
+        assert state.frames_processed == 3
+        assert state.active_tracks == 2  # real: what the tracker holds right now
+        assert set(state.counts) == set(Direction)
+        assert state.total_counted == 0
+        assert state.throughput_per_min == 0.0
+        assert state.congestion is CongestionLevel.FREE_FLOW  # the model default, not derived
+
+    # ...and so is the live video.
+    jpeg = await store.read_frame(uncalibrated.camera_id)
+    assert jpeg is not None
+    assert jpeg[:2] == _JPEG_MAGIC
+
+
+async def test_a_counting_camera_is_unchanged_by_the_switch(store, settings, camera, spies) -> None:
+    """The control for the test above: the same script on a camera that counts really
+    does build a counter, derive congestion, record, and export, so the spies are live."""
+    writer = _RecordingWriter()
+    pipe = _crossing_pipeline(store, settings, camera, writer=writer)
+    exported_before = _crossings_exported_for(camera.camera_id)
+
+    for _ in range(2):
+        await pipe._process_frame(_frame())
+
+    assert _SpyLineCounter.built == 1
+    assert len(spies) == 2  # once per tick
+    assert [e.track_id for e in writer.events] == [1, 2]
+    assert _crossings_exported_for(camera.camera_id) == exported_before + 2
+    assert pipe.state.counting_enabled is True
+    assert pipe.state.counts[Direction.INCOMING].total == 2
+    assert pipe.state.throughput_per_min == 2.0
+
+
+async def test_an_uncalibrated_camera_says_so_from_its_first_state_through_stop(
+    store, settings, camera
+) -> None:
+    pipe = _crossing_pipeline(store, settings, _uncalibrated(camera))
+
+    assert pipe.state.counting_enabled is False  # STARTING, before any frame
+    await pipe._publish_error("could not open video")
+    assert pipe.state.counting_enabled is False
+    await pipe._publish_stopped()
+    published = await store.read_state(_UNCALIBRATED_ID)
+    assert published is not None
+    assert published.counting_enabled is False
+
+
+async def test_the_registry_pipelines_follow_each_cameras_counting_flag(store, settings) -> None:
+    pipelines = {p.camera_id: p for p in build_pipelines(settings, store)}
+
+    for camera in pipeline_module.CAMERAS:
+        assert pipelines[camera.camera_id].state.counting_enabled is camera.counting_enabled
+    assert pipelines["toll-plaza-a"].state.counting_enabled is True
+    assert pipelines["toll-plaza-b"].state.counting_enabled is False

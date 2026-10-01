@@ -22,6 +22,7 @@ import asyncio
 import time
 from collections import deque
 from collections.abc import Callable
+from typing import Any
 
 import cv2
 import numpy as np
@@ -81,7 +82,9 @@ class CameraPipeline:
         self._plate_reader = build_plate_reader(settings)
 
         # Sized lazily, on the first processed frame, once the real frame
-        # dimensions (post-resize) are known.
+        # dimensions (post-resize) are known. `_line_counter` is never built for a
+        # camera with `counting_enabled=False`: its absence is what keeps that camera
+        # from counting, recording or deriving anything from crossings.
         self._line_counter: LineCounter | None = None
         self._annotator: FrameAnnotator | None = None
         self._throughput = ThroughputWindow()
@@ -102,6 +105,7 @@ class CameraPipeline:
             status=PipelineStatus.STARTING,
             updated_at=utcnow(),
             anpr_enabled=settings.anpr_enabled,
+            counting_enabled=camera.counting_enabled,
         )
         # Registers the series at startup, so a scrape between process start and the
         # first decoded frame reports `starting` instead of omitting the camera.
@@ -181,32 +185,49 @@ class CameraPipeline:
         (every `detect_every_n_frames`), track (every frame), count crossings,
         derive congestion, annotate, and publish. Split out from `_run_loop` so it
         is directly testable against a synthetic frame, with no video file needed.
+
+        A camera with `counting_enabled=False` still decodes, detects, tracks,
+        annotates and publishes, but never builds a `LineCounter`: nothing is counted,
+        recorded, submitted to history or exported as `crossings_total`, and throughput
+        and congestion are not derived.
         """
         height, width = frame.shape[:2]
-        if self._line_counter is None or self._annotator is None:
-            self._line_counter = LineCounter(self._camera.counting_line, width, height)
+        if self._annotator is None:
             self._annotator = FrameAnnotator(
                 self._camera.counting_line, jpeg_quality=self._settings.jpeg_quality
             )
+        if self._camera.counting_enabled and self._line_counter is None:
+            self._line_counter = LineCounter(self._camera.counting_line, width, height)
 
         if self._frame_index % self._settings.detect_every_n_frames == 0:
             self._last_detections = await asyncio.to_thread(self._detect_and_filter, frame)
 
         tracked = self._tracker.update(self._last_detections)
         class_names = self._detector.class_names
+        active_tracks = len(tracked)
 
-        crossings = self._line_counter.update(tracked, class_names)
-        if crossings:
-            await self._record_crossings(crossings, tracked, frame)
+        # `_line_counter` exists only for a camera with counting enabled; without one,
+        # nothing below counts, records, submits to history or derives throughput.
+        if self._line_counter is not None:
+            crossings = self._line_counter.update(tracked, class_names)
+            if crossings:
+                await self._record_crossings(crossings, tracked, frame)
 
         now = utcnow()
-        active_tracks = len(tracked)
-        throughput_per_min = self._throughput.per_minute(now=now)
-        congestion = derive_congestion(
-            throughput_per_min=throughput_per_min,
-            capacity_per_min=self._camera.capacity_per_min,
-            active_tracks=active_tracks,
-        )
+        # Counting-derived fields. Left out for an uncalibrated camera, so `CameraState`
+        # keeps its zero/default values there rather than anything computed.
+        counted: dict[str, Any] = {}
+        if self._line_counter is not None:
+            throughput_per_min = self._throughput.per_minute(now=now)
+            counted = {
+                "counts": self._line_counter.counts,
+                "throughput_per_min": throughput_per_min,
+                "congestion": derive_congestion(
+                    throughput_per_min=throughput_per_min,
+                    capacity_per_min=self._camera.capacity_per_min,
+                    active_tracks=active_tracks,
+                ),
+            }
 
         self._frame_index += 1
         self._state = CameraState(
@@ -214,14 +235,13 @@ class CameraPipeline:
             name=self._camera.name,
             status=PipelineStatus.RUNNING,
             updated_at=now,
-            counts=self._line_counter.counts,
             active_tracks=active_tracks,
-            throughput_per_min=throughput_per_min,
-            congestion=congestion,
             pipeline_fps=self._measure_fps(),
             frames_processed=self._frame_index,
             anpr_enabled=self._settings.anpr_enabled,
+            counting_enabled=self._camera.counting_enabled,
             error=None,
+            **counted,
         )
         # Before the Redis write, not after: metrics are in-memory, so a Redis outage
         # (which raises out of `publish_state`) must not also blind the scrape.

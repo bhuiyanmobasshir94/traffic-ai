@@ -14,7 +14,8 @@ When `Settings.api_token` is set, every server-side request carries it as a
 bearer token. The token lives only inside the `httpx.Client` headers: it is not
 stored on this object, not interpolated into any exception message, and never
 rendered. A 401 is its own error (`ApiUnauthorized`) so a missing or wrong
-token reads as exactly that rather than as "worker down".
+token reads as exactly that rather than as "worker down". A 409 is likewise its own
+error (`CountingNotCalibrated`): the camera is not calibrated for counting.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ import httpx
 import streamlit as st
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
+from traffic_ai.cameras import DEFAULT_COUNTING_DISABLED_REASON
 from traffic_ai.config import Settings, get_settings
 from traffic_ai.domain import CameraState, CameraSummary, CrossingEvent, Direction
 
@@ -58,6 +60,16 @@ class ApiUnauthorized(WorkerUnavailable):
 class HistoryUnavailable(WorkerUnavailable):
     """The API answered 503 on a history endpoint: persistence is off or the
     database is down. Live data is unaffected; only history is missing."""
+
+
+class CountingNotCalibrated(WorkerUnavailable):
+    """The API answered 409: counting is switched off for the camera asked about, so it
+    serves no crossings, live or historical, for it. Not a fault and not "no data yet".
+
+    The message is fixed rather than the response's `detail`: nothing the worker sends is
+    rendered verbatim. The registry (`CameraConfig.counting_disabled_reason`) is where a
+    page gets the camera-specific wording.
+    """
 
 
 # --- history results ---------------------------------------------------------
@@ -262,6 +274,11 @@ class WorkerClient:
             raise WorkerUnavailable(f"could not reach worker at {path}: {exc}") from exc
         if response.status_code == 401:
             raise ApiUnauthorized(_UNAUTHORIZED_MESSAGE)
+        # The only 409 the API returns: a per-camera crossings or history route asked
+        # about a camera whose counting is off. Without this it would surface as a generic
+        # "worker returned 409", which the live region reports as an unreachable worker.
+        if response.status_code == 409:
+            raise CountingNotCalibrated(DEFAULT_COUNTING_DISABLED_REASON)
         return response
 
     def _get_json(self, path: str, *, params: dict[str, object] | None = None) -> object:

@@ -44,16 +44,22 @@ class FrameAnnotator:
         if labels:
             canvas = self._label_annotator.annotate(canvas, tracked, labels=labels)
 
-        start = (round(self._line.start[0] * width), round(self._line.start[1] * height))
-        end = (round(self._line.end[0] * width), round(self._line.end[1] * height))
-        cv2.line(canvas, start, end, _LINE_COLOR, 2, lineType=cv2.LINE_AA)
+        # An uncalibrated camera counts nothing, so a counting line on it would imply a
+        # gate that is not being measured.
+        if state.counting_enabled:
+            start = (round(self._line.start[0] * width), round(self._line.start[1] * height))
+            end = (round(self._line.end[0] * width), round(self._line.end[1] * height))
+            cv2.line(canvas, start, end, _LINE_COLOR, 2, lineType=cv2.LINE_AA)
 
-        overlay = (
-            f"{state.name} | {state.status.value} | {state.congestion.label} | "
-            f"{state.throughput_per_min:.1f}/min | tracks={state.active_tracks}"
-        )
         cv2.putText(
-            canvas, overlay, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, _TEXT_COLOR, 2, cv2.LINE_AA
+            canvas,
+            self.overlay_text(state),
+            (10, 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            _TEXT_COLOR,
+            2,
+            cv2.LINE_AA,
         )
         if state.error:
             cv2.putText(
@@ -73,6 +79,21 @@ class FrameAnnotator:
         if not ok:
             raise RuntimeError("JPEG encode failed")
         return buffer.tobytes()
+
+    @staticmethod
+    def overlay_text(state: CameraState) -> str:
+        """The status line burned into the frame. An uncalibrated camera shows no
+        congestion and no rate: they would be unmeasured values on a measured-looking
+        overlay."""
+        if not state.counting_enabled:
+            return (
+                f"{state.name} | {state.status.value} | counting not calibrated | "
+                f"tracks={state.active_tracks}"
+            )
+        return (
+            f"{state.name} | {state.status.value} | {state.congestion.label} | "
+            f"{state.throughput_per_min:.1f}/min | tracks={state.active_tracks}"
+        )
 
     @staticmethod
     def _labels(tracked: sv.Detections, class_names: dict[int, str]) -> list[str]:

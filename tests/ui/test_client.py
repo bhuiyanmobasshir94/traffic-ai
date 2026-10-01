@@ -13,10 +13,12 @@ from datetime import UTC, datetime, timedelta, timezone
 import httpx
 import pytest
 
+from traffic_ai.cameras import DEFAULT_COUNTING_DISABLED_REASON
 from traffic_ai.config import Settings
 from traffic_ai.domain import CameraSummary, CrossingEvent, Direction, PipelineStatus
 from traffic_ai.ui.client import (
     ApiUnauthorized,
+    CountingNotCalibrated,
     HistoryCounts,
     HistoryHourly,
     HistoryUnavailable,
@@ -419,6 +421,57 @@ def test_history_connection_error_is_generic_worker_unavailable() -> None:
     with pytest.raises(WorkerUnavailable) as excinfo:
         _client(handler).history_hourly(since=_SINCE, until=_NOW)
     assert not isinstance(excinfo.value, ApiUnauthorized | HistoryUnavailable)
+
+
+# --- 409: counting is not calibrated for the camera ---------------------------
+
+
+def test_409_raises_counting_not_calibrated_on_every_crossings_route() -> None:
+    """The API's 409 means "this camera has no crossings to serve". It must not read as
+    "worker returned 409" (a generic fault), as an outage, or as history being down."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(409, json={"detail": "worker-supplied text that is not echoed"})
+
+    client = _client(handler)
+    calls = (
+        lambda: client.events("toll-plaza-b"),
+        client.history_events,
+        lambda: client.history_counts(since=_SINCE, until=_NOW, camera_id="toll-plaza-b"),
+        lambda: client.history_hourly(since=_SINCE, until=_NOW, camera_id="toll-plaza-b"),
+    )
+    for call in calls:
+        with pytest.raises(CountingNotCalibrated) as excinfo:
+            call()
+        # The fixed registry wording, not whatever the response body carried.
+        assert str(excinfo.value) == DEFAULT_COUNTING_DISABLED_REASON
+        assert "worker-supplied" not in str(excinfo.value)
+        assert not isinstance(excinfo.value, ApiUnauthorized | HistoryUnavailable)
+
+
+def test_counting_not_calibrated_stays_catchable_as_worker_unavailable() -> None:
+    # A caller that only knows `WorkerUnavailable` degrades rather than crashing.
+    assert issubclass(CountingNotCalibrated, WorkerUnavailable)
+    assert not issubclass(CountingNotCalibrated, ApiUnauthorized | HistoryUnavailable)
+    assert not issubclass(ApiUnauthorized, CountingNotCalibrated)
+    assert not issubclass(HistoryUnavailable, CountingNotCalibrated)
+
+
+def test_409_does_not_disturb_the_neighbouring_status_mappings() -> None:
+    # 401 and 503 keep their own errors; 500 stays generic.
+    client = _client(
+        lambda request: httpx.Response(
+            {"/api/history/counts": 401, "/api/history/hourly": 503}.get(request.url.path, 500),
+            json={"detail": "x"},
+        )
+    )
+    with pytest.raises(ApiUnauthorized):
+        client.history_counts(since=_SINCE, until=_NOW)
+    with pytest.raises(HistoryUnavailable):
+        client.history_hourly(since=_SINCE, until=_NOW)
+    with pytest.raises(WorkerUnavailable, match="500") as excinfo:
+        client.history_events()
+    assert not isinstance(excinfo.value, CountingNotCalibrated)
 
 
 # --- history parsing ----------------------------------------------------------

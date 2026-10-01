@@ -17,10 +17,10 @@ Kubernetes. It processes demo footage, not live camera feeds.
 | --- | --- |
 | Vehicle detection (car, motorcycle, bus, truck, bicycle) | Working: torchvision by default, YOLO via `ultralytics` opt-in |
 | Multi-object tracking across frames | Working: ByteTrack via `supervision` |
-| Directional counting (incoming / outgoing, by class) | Working: line crossing, edge-triggered |
+| Directional counting (incoming / outgoing, by class) | Working on Toll Plaza A (line crossing, edge-triggered). Toll Plaza B is marked "not calibrated": tracking on its footage is too unstable to count, so it shows live video only |
 | Congestion level from measured flow and density | Working: derived, not hardcoded |
 | Annotated live video in the browser | Working: MJPEG, server-side annotation |
-| Map with per-corridor congestion colouring | Working: Folium, colour from live state |
+| Map with per-corridor congestion colouring | Working: Folium, colour from live state; uncalibrated cameras are drawn grey |
 | Crossing history in Postgres, history API, Analytics page | Implemented and unit-tested; not yet exercised end to end in a deployed stack |
 | Prometheus metrics at `/api/metrics` | Implemented and unit-tested |
 | API bearer-token auth, rate limiting, security headers | Implemented and unit-tested |

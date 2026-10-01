@@ -103,6 +103,12 @@ class CountingLine:
     incoming_is_downward: bool = True
 
 
+# Said whenever a camera's counting is off and no reason came with it (a bare
+# `counting_enabled=False`, or a worker that answered 409 without one): failing to explain
+# must not turn into showing the numbers.
+DEFAULT_COUNTING_DISABLED_REASON = "Counting is not calibrated for this camera."
+
+
 @dataclass(frozen=True)
 class CameraConfig:
     camera_id: str
@@ -115,6 +121,12 @@ class CameraConfig:
     # Vehicles per minute at which the corridor is considered saturated. Used to
     # derive a congestion level from measured throughput instead of hardcoding it.
     capacity_per_min: float = 60.0
+    # False means the camera still decodes, detects, tracks and streams live video, but
+    # its line-crossing counts, throughput, congestion and history are NOT presented:
+    # none of them is trustworthy for this footage, and a number that is not measured
+    # must not look measured. Set it only with a reason, which the UI shows verbatim.
+    counting_enabled: bool = True
+    counting_disabled_reason: str = ""
 
     def video_path(self, video_dir: Path) -> Path:
         return video_dir / self.video_filename
@@ -138,6 +150,17 @@ CAMERAS: tuple[CameraConfig, ...] = (
         longitude=90.47714944282039,
         description="Dhaka Bypass eastbound, secondary gate.",
         capacity_per_min=50.0,
+        # Measured 2026-10-01 over 900 frames of toll-plaza-b.mp4 with the real torchvision
+        # detector and ByteTrack: 3,932 track IDs for a scene of ~50 vehicles (median
+        # track life 3-13 frames). Every horizontal line from y=0.40 to 0.95 scored
+        # 0-540 crossings for the same 30 s, and gating on track age moved that to 6-530,
+        # against roughly 20-30 real incoming vehicles in a slit-scan of the footage.
+        # No line placement is right, so any count from this camera would be invented.
+        counting_enabled=False,
+        counting_disabled_reason=(
+            "Counting is not calibrated for this camera: vehicle tracking on this footage "
+            "is unstable, so crossings cannot be measured reliably."
+        ),
     ),
 )
 
