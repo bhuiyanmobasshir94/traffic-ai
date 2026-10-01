@@ -6,3 +6,4 @@
 - [Read-only anchors can change on resume](anchor-files-can-change-between-resumed-sessions.md) — re-Read anchor files after any session interruption/resume.
 - [uv lock, Docker, CI facts](uv-lock-ci-docker-facts.md) — `test` extra needs `ui` too, opencv collision, action pins, no-daemon build simulation.
 - [Sandbox command guards](sandbox-command-guards.md) — .env is untouchable; compound shell/git-adjacent commands get refused; keep calls plain.
+- [AppTest + httpx token traps](streamlit-apptest-and-httpx-token-traps.md) — charts are `vega_lite_chart`; h11 error quotes a bad token header; page-test monkeypatch recipe.

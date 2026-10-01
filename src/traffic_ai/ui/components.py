@@ -8,6 +8,8 @@ UI lives here instead, so a fix applies everywhere at once.
 from __future__ import annotations
 
 import html
+from collections.abc import Sequence
+from datetime import UTC
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +64,8 @@ def _build_stream_markup(camera_id: str, public_base_url: str) -> str | None:
     camera = CAMERAS_BY_ID.get(camera_id)
     if camera is None:
         return None
+    # A browser <img> cannot send an Authorization header; edge auth (Traefik/ingress)
+    # injects the token, so it is never placed in this URL or markup.
     url = html.escape(
         f"{public_base_url.rstrip('/')}/cameras/{camera.camera_id}/stream.mjpg", quote=True
     )
@@ -139,6 +143,33 @@ def render_stats(state: CameraState | None) -> None:
             )
 
 
+def build_event_rows(
+    events: Sequence[CrossingEvent], *, time_format: str = "%H:%M:%S"
+) -> list[dict[str, str]]:
+    """Table rows for a crossings list, shared by the live and history views.
+
+    `plate_text` is `None` whenever no plate model read the vehicle — that
+    renders as an explicit dash, never an invented plate. Timezone-aware times
+    are shown in UTC so the live table and the history table agree.
+    """
+    rows: list[dict[str, str]] = []
+    for event in events:
+        crossed_at = event.crossed_at
+        if crossed_at.tzinfo is not None:
+            crossed_at = crossed_at.astimezone(UTC)
+        rows.append(
+            {
+                "time": crossed_at.strftime(time_format),
+                "camera": event.camera_id,
+                "class": event.vehicle_class,
+                "direction": event.direction.value,
+                "confidence": f"{event.confidence:.0%}",
+                "plate": event.plate_text if event.plate_text is not None else "—",
+            }
+        )
+    return rows
+
+
 def render_events(events: list[CrossingEvent]) -> None:
     """Recent crossings table. `plate_text` is `None` whenever ANPR is not
     enabled — that renders as an explicit dash, never an invented plate."""
@@ -146,18 +177,7 @@ def render_events(events: list[CrossingEvent]) -> None:
         st.caption("No crossings recorded yet.")
         return
 
-    rows = [
-        {
-            "time": event.crossed_at.strftime("%H:%M:%S"),
-            "camera": event.camera_id,
-            "class": event.vehicle_class,
-            "direction": event.direction.value,
-            "confidence": f"{event.confidence:.0%}",
-            "plate": event.plate_text if event.plate_text is not None else "—",
-        }
-        for event in events
-    ]
-    st.dataframe(rows, hide_index=True, use_container_width=True)
+    st.dataframe(build_event_rows(events), hide_index=True, use_container_width=True)
     if all(event.plate_text is None for event in events):
         st.caption("ANPR stage not enabled — plates are not read.")
 
