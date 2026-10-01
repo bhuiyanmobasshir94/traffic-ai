@@ -188,6 +188,9 @@ class TestTokenWhitespaceAndControlCharacters:
             "a" * 40 + "\x1b",
             "a" * 40 + chr(0xA0),  # no-break space
             "a" * 40 + chr(0x200B),  # zero-width space: not whitespace, not printable
+            # Printable but non-ASCII: ui/client.py refuses to send it, so the worker must
+            # refuse to start with it rather than accept a token no client can present.
+            "a" * 40 + "é",
         ],
     )
     @pytest.mark.parametrize("environment", ["development", "production"])
@@ -198,7 +201,7 @@ class TestTokenWhitespaceAndControlCharacters:
             build(environment=environment, api_token=token, database_url=REAL_DB_URL)
 
         message = problems_from(caught.value)
-        assert "TRAFFIC_AI_API_TOKEN contains whitespace or a control character" in message
+        assert "TRAFFIC_AI_API_TOKEN must be visible ASCII" in message
         assert "a" * 40 not in message  # the value is never echoed
 
     def test_a_clean_token_with_punctuation_is_accepted(self) -> None:

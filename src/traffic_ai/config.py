@@ -185,15 +185,19 @@ class Settings(BaseSettings):
         h11 error a bad header value produces quotes the whole header, token included.
         Checked in every environment because the mismatch is just as real on a laptop.
         The message names the problem and never the value.
+
+        The accepted set is visible ASCII (0x21-0x7E), exactly what `ui/client.py`
+        `_checked_token` sends. A wider set here -- say a printable "é" -- would let the
+        worker start with a token the UI can never present, failing at runtime instead.
         """
         if value is None:
             return None
         token = value.get_secret_value()
-        if any(ch.isspace() or not ch.isprintable() for ch in token):
+        if any(not ("!" <= ch <= "~") for ch in token):
             raise ValueError(
-                "TRAFFIC_AI_API_TOKEN contains whitespace or a control character (a trailing "
-                "newline from a secret file is the usual cause). Strip it, or generate one "
-                "with `openssl rand -hex 32`."
+                "TRAFFIC_AI_API_TOKEN must be visible ASCII with no whitespace or control "
+                "characters (a trailing newline from a secret file is the usual cause). "
+                "Strip it, or generate one with `openssl rand -hex 32`."
             )
         return value
 
