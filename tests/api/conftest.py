@@ -140,18 +140,36 @@ def broken_store() -> BrokenStore:
 def app_factory(settings: Settings, store: StateStore) -> Callable[..., FastAPI]:
     """Build an app wired to the test `settings` and `store` fixtures by
     default. Pass `pipelines=[...]`, `store_override=...`, or
-    `settings_override=...` to change any of them."""
+    `settings_override=...` to change any of them.
+
+    Persistence is OFF unless asked for. `Settings.persistence_enabled` defaults to
+    True, which would point every unrelated test's lifespan at the development
+    database URL (`postgres:5432`) and make readiness probes depend on whether that
+    hostname resolves. Pass `persistence=True`, or inject a `database`/`writer`, to
+    opt in. `pipeline_factory` replaces the default factory when a test needs to see
+    the `writer` the lifespan hands out.
+    """
 
     def build(
         *,
         pipelines: list[CameraPipeline] | None = None,
         store_override: object | None = None,
         settings_override: Settings | None = None,
+        persistence: bool = False,
+        database: object | None = None,
+        writer: object | None = None,
+        pipeline_factory: PipelineFactory | None = None,
     ) -> FastAPI:
+        resolved = settings_override or settings
+        wants_persistence = persistence or database is not None or writer is not None
+        if not wants_persistence:
+            resolved = resolved.model_copy(update={"persistence_enabled": False})
         return create_app(
-            settings=settings_override or settings,
+            settings=resolved,
             store=store_override or store,  # type: ignore[arg-type]
-            pipeline_factory=_pipeline_factory_with(*(pipelines or [])),
+            pipeline_factory=pipeline_factory or _pipeline_factory_with(*(pipelines or [])),
+            database=database,  # type: ignore[arg-type]
+            writer=writer,  # type: ignore[arg-type]
         )
 
     return build

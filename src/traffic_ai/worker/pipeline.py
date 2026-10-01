@@ -8,19 +8,28 @@ long-running coroutine that loops the demo video forever and never raises out: a
 missing file, a corrupt frame, or a detector failure is caught, published as
 `PipelineStatus.ERROR`, and retried with backoff, so one camera's fault cannot take
 the whole API process down with it.
+
+Two side channels leave the frame loop and both are fail-open: crossings are
+handed to the `CrossingWriter` (Postgres history) and tick state is mirrored into
+Prometheus. A database that is down or a metric that raises costs history or a
+graph, never a frame — `submit()` is a non-blocking in-memory append, and every
+metric update is guarded.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 
 import cv2
 import numpy as np
 import supervision as sv
 
+from traffic_ai import metrics
 from traffic_ai.cameras import CAMERAS, CameraConfig
 from traffic_ai.config import Settings
+from traffic_ai.db.writer import CrossingWriter
 from traffic_ai.domain import VEHICLE_CLASSES, CameraState, CrossingEvent, PipelineStatus
 from traffic_ai.logging import get_logger
 from traffic_ai.store import StateStore, utcnow
@@ -43,6 +52,9 @@ class CameraPipeline:
     a hand-built `VehicleTracker`) without loading real weights; production code
     leaves both `None` and gets `build_detector(settings)` / a fresh
     `ByteTrackTracker`.
+
+    `writer` is the durable-history sink. `None` (the default) means live-only:
+    persistence disabled, or the database could not be set up at startup.
     """
 
     def __init__(
@@ -53,10 +65,12 @@ class CameraPipeline:
         *,
         detector: Detector | None = None,
         tracker: VehicleTracker | None = None,
+        writer: CrossingWriter | None = None,
     ) -> None:
         self._camera = camera
         self._store = store
         self._settings = settings
+        self._writer = writer
         self._detector = detector or build_detector(settings)
         self._tracker = tracker or ByteTrackTracker(frame_rate=settings.target_fps)
         self._plate_reader = build_plate_reader(settings)
@@ -71,6 +85,8 @@ class CameraPipeline:
         self._last_detections: sv.Detections = sv.Detections.empty()
         self._last_tick_monotonic: float | None = None
         self._stop_requested = False
+        # A metric that raises would do so on every tick (~12/s); warn once, not per frame.
+        self._metrics_failure_logged = False
 
         self._state = CameraState(
             camera_id=camera.camera_id,
@@ -79,6 +95,9 @@ class CameraPipeline:
             updated_at=utcnow(),
             anpr_enabled=settings.anpr_enabled,
         )
+        # Registers the series at startup, so a scrape between process start and the
+        # first decoded frame reports `starting` instead of omitting the camera.
+        self._publish_status_metric(PipelineStatus.STARTING)
 
     @property
     def camera_id(self) -> str:
@@ -196,6 +215,9 @@ class CameraPipeline:
             anpr_enabled=self._settings.anpr_enabled,
             error=None,
         )
+        # Before the Redis write, not after: metrics are in-memory, so a Redis outage
+        # (which raises out of `publish_state`) must not also blind the scrape.
+        self._publish_tick_metrics(self._state)
         await self._store.publish_state(self._state)
 
         jpeg = self._annotator.render(frame, tracked, class_names, self._state)
@@ -261,8 +283,63 @@ class CameraPipeline:
                 direction=crossing.direction.value,
             )
 
+        # History and metrics BEFORE the Redis append: the crossing has already been
+        # counted, so a Redis failure raising out of `append_events` must not also
+        # cost the durable record of it.
+        for event in events:
+            self._submit_to_writer(event)
+            self._count_crossing_metric(event)
+
         self._throughput.record(len(events))
         await self._store.append_events(events)
+
+    def _submit_to_writer(self, event: CrossingEvent) -> None:
+        if self._writer is None:
+            return
+        try:
+            self._writer.submit(event)
+        except Exception as exc:
+            # `submit()` is a plain in-memory append and is not expected to fail, but
+            # history is a side channel: whatever goes wrong here costs one record,
+            # never the frame loop.
+            log.warning(
+                "history_submit_failed",
+                camera_id=self.camera_id,
+                track_id=event.track_id,
+                error=str(exc),
+            )
+
+    def _count_crossing_metric(self, event: CrossingEvent) -> None:
+        # `vehicle_class` is bounded by the VEHICLE_CLASSES filter at the pipeline
+        # boundary and `camera_id` by the registry, so label cardinality is fixed.
+        self._guarded_metric_update(
+            lambda: metrics.crossings_total.labels(
+                self.camera_id, event.direction.value, event.vehicle_class
+            ).inc()
+        )
+
+    def _publish_tick_metrics(self, state: CameraState) -> None:
+        def update() -> None:
+            metrics.pipeline_frames_processed_total.labels(self.camera_id).inc()
+            metrics.pipeline_fps.labels(self.camera_id).set(state.pipeline_fps)
+            metrics.pipeline_active_tracks.labels(self.camera_id).set(state.active_tracks)
+            metrics.pipeline_status.labels(self.camera_id).state(state.status.value)
+
+        self._guarded_metric_update(update)
+
+    def _publish_status_metric(self, status: PipelineStatus) -> None:
+        self._guarded_metric_update(
+            lambda: metrics.pipeline_status.labels(self.camera_id).state(status.value)
+        )
+
+    def _guarded_metric_update(self, update: Callable[[], None]) -> None:
+        """Observability fails open: a metrics fault must never reach the frame loop."""
+        try:
+            update()
+        except Exception as exc:
+            if not self._metrics_failure_logged:
+                self._metrics_failure_logged = True
+                log.warning("metrics_update_failed", camera_id=self.camera_id, error=str(exc))
 
     def _measure_fps(self) -> float:
         now = time.monotonic()
@@ -279,12 +356,14 @@ class CameraPipeline:
         self._state = self._state.model_copy(
             update={"status": PipelineStatus.ERROR, "updated_at": utcnow(), "error": message}
         )
+        self._publish_status_metric(PipelineStatus.ERROR)
         await self._safe_publish_state()
 
     async def _publish_stopped(self) -> None:
         self._state = self._state.model_copy(
             update={"status": PipelineStatus.STOPPED, "updated_at": utcnow()}
         )
+        self._publish_status_metric(PipelineStatus.STOPPED)
         await self._safe_publish_state()
 
     async def _safe_publish_state(self) -> None:
@@ -295,6 +374,12 @@ class CameraPipeline:
             log.error("state_publish_failed", camera_id=self.camera_id, error=str(exc))
 
 
-def build_pipelines(settings: Settings, store: StateStore) -> list[CameraPipeline]:
-    """One `CameraPipeline` per registered camera (`traffic_ai.cameras.CAMERAS`)."""
-    return [CameraPipeline(camera, store, settings) for camera in CAMERAS]
+def build_pipelines(
+    settings: Settings, store: StateStore, writer: CrossingWriter | None = None
+) -> list[CameraPipeline]:
+    """One `CameraPipeline` per registered camera (`traffic_ai.cameras.CAMERAS`).
+
+    All pipelines share one `writer`: batching only pays off if the cameras feed a
+    single buffer rather than one INSERT stream each.
+    """
+    return [CameraPipeline(camera, store, settings, writer=writer) for camera in CAMERAS]

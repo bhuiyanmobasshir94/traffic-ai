@@ -12,6 +12,7 @@ so `traffic_ai.api.app` stays importable with the worker package absent.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -26,6 +27,9 @@ from traffic_ai import metrics
 from traffic_ai.api.middleware import AuthMiddleware, RateLimitMiddleware, SecurityHeadersMiddleware
 from traffic_ai.api.routes import router
 from traffic_ai.config import Settings, get_settings
+from traffic_ai.db.session import Database
+from traffic_ai.db.sink import RepositoryHistory, RepositorySink
+from traffic_ai.db.writer import CrossingWriter
 from traffic_ai.domain import CameraState
 from traffic_ai.logging import configure_logging, get_logger
 from traffic_ai.store import StateStore
@@ -56,15 +60,45 @@ class CameraPipeline(Protocol):
     def request_stop(self) -> None: ...
 
 
-PipelineFactory = Callable[[Settings, StateStore], list[CameraPipeline]]
+# A factory takes `(settings, store)` and MAY also declare a `writer` keyword to receive the
+# history writer. Factories predating persistence declare only the first two, and are
+# still called that way — see `_build_pipelines`.
+PipelineFactory = Callable[..., list[CameraPipeline]]
 
 
-def default_pipeline_factory(settings: Settings, store: StateStore) -> list[CameraPipeline]:
+def default_pipeline_factory(
+    settings: Settings, store: StateStore, writer: CrossingWriter | None = None
+) -> list[CameraPipeline]:
     """Build the real pipelines. Imports `traffic_ai.worker` lazily so importing
     this module never requires the worker package to exist."""
     from traffic_ai.worker.pipeline import build_pipelines
 
-    return build_pipelines(settings, store)
+    return build_pipelines(settings, store, writer)
+
+
+def _accepts_writer(factory: PipelineFactory) -> bool:
+    try:
+        parameters = inspect.signature(factory).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == "writer" or p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters)
+
+
+def _build_pipelines(
+    factory: PipelineFactory,
+    settings: Settings,
+    store: StateStore,
+    writer: CrossingWriter | None,
+) -> list[CameraPipeline]:
+    """Offer `writer` only to a factory that declares it.
+
+    Handing an unexpected keyword to a two-argument factory would be a `TypeError` at
+    startup, so persistence is opt-in on the factory's side rather than a signature
+    change every existing factory must absorb.
+    """
+    if writer is not None and _accepts_writer(factory):
+        return factory(settings, store, writer=writer)
+    return factory(settings, store)
 
 
 async def _run_pipeline(pipeline: CameraPipeline) -> None:
@@ -77,6 +111,17 @@ async def _run_pipeline(pipeline: CameraPipeline) -> None:
         raise
     except Exception:
         logger.exception("pipeline.crashed", camera_id=pipeline.camera_id)
+
+
+async def _run_writer(writer: CrossingWriter) -> None:
+    """Run the history writer to completion. `CrossingWriter.run()` is documented never
+    to raise, but like `_run_pipeline` a background task must not die silently."""
+    try:
+        await writer.run()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("db.writer_crashed")
 
 
 async def _request_id_middleware(
@@ -153,16 +198,25 @@ def create_app(
     settings: Settings | None = None,
     store: StateStore | None = None,
     pipeline_factory: PipelineFactory = default_pipeline_factory,
+    database: Database | None = None,
+    writer: CrossingWriter | None = None,
 ) -> FastAPI:
     """Build the ASGI app.
 
     `store` and `pipeline_factory` are injectable so tests never need a real
     Redis server or a real inference pipeline. When `store` is given, this app
     does not own its lifecycle and will not close it on shutdown — the caller
-    (a fixture, typically) does.
+    (a fixture, typically) does. `database` follows the same rule.
+
+    `database` and `writer` are likewise injectable, and only consulted when
+    `settings.persistence_enabled` is true. An injected `writer` is still started
+    and drained by the lifespan: running it is part of serving, unlike closing a
+    connection someone else opened.
     """
     resolved_settings = settings or get_settings()
     injected_store = store
+    injected_database = database
+    injected_writer = writer
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -179,18 +233,58 @@ def create_app(
             event_history=resolved_settings.event_history,
         )
 
-        pipelines = pipeline_factory(resolved_settings, state_store)
-        tasks = [asyncio.create_task(_run_pipeline(p)) for p in pipelines]
+        # Persistence is optional and strictly additive: a database that cannot be set up
+        # leaves the live dashboard running with no history, rather than no service.
+        history_db: Database | None = None
+        owns_database = False
+        history_writer: CrossingWriter | None = None
+        writer_task: asyncio.Task[None] | None = None
+        if resolved_settings.persistence_enabled:
+            try:
+                history_db = injected_database
+                if history_db is None:
+                    history_db = Database.from_settings(resolved_settings)
+                    owns_database = True
+                history_writer = (
+                    injected_writer
+                    if injected_writer is not None
+                    else CrossingWriter.from_settings(RepositorySink(history_db), resolved_settings)
+                )
+            except Exception as exc:
+                # Bad URL, missing driver, invalid pool settings. Live-only from here on.
+                logger.error("db.init_failed", error=str(exc))
+                if owns_database and history_db is not None:
+                    await history_db.close()
+                history_db, history_writer, owns_database = None, None, False
+        if history_writer is not None:
+            # Started before the pipelines so the first crossing already has a consumer.
+            writer_task = asyncio.create_task(_run_writer(history_writer))
 
-        app.state.settings = resolved_settings
-        app.state.store = state_store
-        app.state.pipelines = pipelines
-        app.state.pipeline_tasks = tasks
-
-        logger.info("api.startup", camera_count=len(pipelines))
+        pipelines: list[CameraPipeline] = []
+        tasks: list[asyncio.Task[None]] = []
         try:
+            pipelines = _build_pipelines(
+                pipeline_factory, resolved_settings, state_store, history_writer
+            )
+            tasks = [asyncio.create_task(_run_pipeline(p)) for p in pipelines]
+
+            app.state.settings = resolved_settings
+            app.state.store = state_store
+            app.state.pipelines = pipelines
+            app.state.pipeline_tasks = tasks
+            app.state.database = history_db
+            app.state.history = RepositoryHistory(history_db) if history_db is not None else None
+
+            logger.info(
+                "api.startup",
+                camera_count=len(pipelines),
+                persistence=history_db is not None,
+            )
             yield
         finally:
+            # Order matters: pipelines first, so nothing is still calling `submit()` when
+            # the writer drains. Reversed, the final crossings land in a buffer nobody
+            # flushes.
             for pipeline in pipelines:
                 pipeline.request_stop()
             if tasks:
@@ -203,6 +297,18 @@ def create_app(
                     logger.warning("api.shutdown_timeout", pending_tasks=len(tasks))
                     for task in tasks:
                         task.cancel()
+            if history_writer is not None and writer_task is not None:
+                history_writer.request_stop()
+                try:
+                    await asyncio.wait_for(writer_task, timeout=_SHUTDOWN_TIMEOUT_SECONDS)
+                except TimeoutError:
+                    # `wait_for` has cancelled the task: whatever was still buffered is lost.
+                    # Counted so the loss is visible rather than silent.
+                    logger.warning(
+                        "db.shutdown_drain_timeout", abandoned_events=history_writer.pending_count
+                    )
+            if owns_database and history_db is not None:
+                await history_db.close()
             if owns_store:
                 await state_store.close()
             logger.info("api.shutdown")

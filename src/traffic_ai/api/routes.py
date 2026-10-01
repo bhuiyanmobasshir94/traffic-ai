@@ -9,21 +9,34 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from traffic_ai import __version__
-from traffic_ai.api.dependencies import get_camera_or_404, get_settings_dep, get_store_dep
+from traffic_ai.api.dependencies import (
+    HistoryReader,
+    HistoryWindow,
+    get_camera_or_404,
+    get_history_camera_id,
+    get_history_reader,
+    get_history_window,
+    get_settings_dep,
+    get_store_dep,
+)
 from traffic_ai.cameras import CAMERAS, CameraConfig
 from traffic_ai.config import Settings
 from traffic_ai.domain import (
     CameraState,
     CameraSummary,
     CrossingEvent,
+    Direction,
     HealthResponse,
+    HistoryCounts,
+    HourlyBucket,
+    HourlyTotals,
     PipelineStatus,
     ReadinessResponse,
 )
@@ -34,6 +47,17 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api")
 
+# How long readiness waits on Postgres before reporting it down. Bounded because a
+# probe that hangs on a black-holed database host would time out the orchestrator's
+# own readiness check and take the instance out of rotation, which is exactly what
+# a database outage is not allowed to do.
+_DATABASE_PROBE_TIMEOUT_SECONDS = 2.0
+
+# Ceiling on one history query, connect included. Kept under the UI's default
+# `api_timeout_seconds` (5s) so the caller gets this route's 503 and its reason
+# rather than giving up on a request that is still holding a pooled connection.
+_HISTORY_QUERY_TIMEOUT_SECONDS = 4.0
+
 # `Annotated[..., Depends(...)]` rather than `= Depends(...)`: the latter is a
 # function call in a default argument, which is exactly what ruff's B008
 # flags — and correctly so in general, just not for FastAPI's own dependency
@@ -42,6 +66,9 @@ router = APIRouter(prefix="/api")
 SettingsDep = Annotated[Settings, Depends(get_settings_dep)]
 StoreDep = Annotated[StateStore, Depends(get_store_dep)]
 CameraDep = Annotated[CameraConfig, Depends(get_camera_or_404)]
+HistoryCameraDep = Annotated[str | None, Depends(get_history_camera_id)]
+HistoryWindowDep = Annotated[HistoryWindow, Depends(get_history_window)]
+HistoryDep = Annotated[HistoryReader, Depends(get_history_reader)]
 
 
 @router.get("/healthz", response_model=HealthResponse)
@@ -50,8 +77,25 @@ async def healthz(settings: SettingsDep) -> HealthResponse:
     return HealthResponse(status="ok", version=__version__, environment=settings.environment)
 
 
+async def _probe_database(request: Request, settings: Settings) -> bool | None:
+    """`None` when persistence is off, otherwise whether Postgres answered a ping.
+
+    Never raises and never blocks past `_DATABASE_PROBE_TIMEOUT_SECONDS`.
+    """
+    if not settings.persistence_enabled:
+        return None
+    database = getattr(request.app.state, "database", None)
+    if database is None:
+        # Persistence is on but setup failed at startup: history is down.
+        return False
+    try:
+        return await asyncio.wait_for(database.ping(), timeout=_DATABASE_PROBE_TIMEOUT_SECONDS)
+    except TimeoutError:
+        return False
+
+
 @router.get("/readyz")
-async def readyz(request: Request, store: StoreDep) -> JSONResponse:
+async def readyz(request: Request, store: StoreDep, settings: SettingsDep) -> JSONResponse:
     """Readiness. Ready only when Redis pings and at least one pipeline is
     actually RUNNING. 503 otherwise, so a load balancer stops sending traffic
     without restarting the container (that's what liveness is for).
@@ -60,6 +104,10 @@ async def readyz(request: Request, store: StoreDep) -> JSONResponse:
     produce a fresh frame, and STOPPED is a container draining on shutdown —
     treating any of them as ready would keep traffic arriving at an instance
     that cannot answer it.
+
+    The database is reported (`database`) but never gates readiness: the live
+    path does not depend on it, so an instance with Postgres down still serves
+    counts, frames and the stream, and should keep receiving traffic for them.
     """
     redis_ok = await store.ping()
     pipelines = getattr(request.app.state, "pipelines", [])
@@ -79,6 +127,7 @@ async def readyz(request: Request, store: StoreDep) -> JSONResponse:
         cameras_running=cameras_running,
         cameras_total=cameras_total,
         detail=detail,
+        database=await _probe_database(request, settings),
     )
     return JSONResponse(status_code=200 if ready else 503, content=body.model_dump())
 
@@ -177,3 +226,74 @@ async def all_events(
     """Merged, newest-first feed across every registered camera."""
     camera_ids = [c.camera_id for c in CAMERAS]
     return await store.read_events_multi(camera_ids, limit)
+
+
+# --- history (Postgres) -----------------------------------------------------
+# Served from the database, not Redis: these survive a worker restart and a state
+# TTL, which the live `/events` and `/cameras/{id}/state` routes do not. Every one is
+# a 503 — never an empty list or a zero — when there is no database to answer.
+
+
+async def _history_query[T](query: Awaitable[T]) -> T:
+    """Await one history query, turning any database failure into a 503.
+
+    The broad catch is deliberate and confined to the query: a driver, pool, or
+    network error is "history is down", which the caller can act on, not a 500 that
+    reads as a bug in this service. The cause is logged; it is not echoed to the
+    client. An `HTTPException` (the 503 from an unavailable source) passes through.
+    """
+    try:
+        async with asyncio.timeout(_HISTORY_QUERY_TIMEOUT_SECONDS):
+            return await query
+    except HTTPException:
+        raise
+    except TimeoutError:
+        logger.warning("history.query_timeout", timeout_s=_HISTORY_QUERY_TIMEOUT_SECONDS)
+        raise HTTPException(
+            status_code=503, detail="history is unavailable: the database did not respond in time"
+        ) from None
+    except Exception as exc:
+        logger.warning("history.query_failed", error=str(exc))
+        raise HTTPException(
+            status_code=503, detail="history is unavailable: the database query failed"
+        ) from None
+
+
+@router.get("/history/events", response_model=list[CrossingEvent])
+async def history_events(
+    camera_id: HistoryCameraDep,
+    reader: HistoryDep,
+    limit: int = Query(default=100, ge=1, le=1000),
+) -> list[CrossingEvent]:
+    """Newest-first crossings from the database. Omit `camera_id` to merge cameras."""
+    return await _history_query(reader.recent(camera_id, limit))
+
+
+@router.get("/history/counts", response_model=HistoryCounts)
+async def history_counts(
+    camera_id: HistoryCameraDep, window: HistoryWindowDep, reader: HistoryDep
+) -> HistoryCounts:
+    """Crossings in `[since, until)` by direction and vehicle class."""
+    raw = await _history_query(reader.counts_by_class(camera_id, window.since, window.until))
+    counts = {direction: dict(raw.get(direction.value, {})) for direction in Direction}
+    return HistoryCounts(
+        camera_id=camera_id,
+        since=window.since,
+        until=window.until,
+        counts=counts,
+        total=sum(n for per_class in counts.values() for n in per_class.values()),
+    )
+
+
+@router.get("/history/hourly", response_model=HourlyTotals)
+async def history_hourly(
+    camera_id: HistoryCameraDep, window: HistoryWindowDep, reader: HistoryDep
+) -> HourlyTotals:
+    """Crossings per UTC hour in `[since, until)`, oldest first; empty hours are absent."""
+    rows = await _history_query(reader.hourly_totals(camera_id, window.since, window.until))
+    return HourlyTotals(
+        camera_id=camera_id,
+        since=window.since,
+        until=window.until,
+        buckets=[HourlyBucket(hour=hour, total=total) for hour, total in rows],
+    )

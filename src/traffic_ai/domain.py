@@ -139,3 +139,43 @@ class ReadinessResponse(BaseModel):
     cameras_running: int
     cameras_total: int
     detail: str | None = None
+    # Reported, never gating: history is a secondary capability, so a down
+    # database must not pull the instance out of rotation while live state still
+    # serves. `None` means persistence is switched off, which is not a failure.
+    database: bool | None = None
+
+
+class HistoryCounts(BaseModel):
+    """Crossings recorded in `[since, until)`, from the database — not the live counters.
+
+    Differs from `CameraState.counts` in scope: that is "since the worker started"
+    and resets on restart; this is whatever Postgres durably holds for the window.
+    """
+
+    # `None` means every camera, summed.
+    camera_id: str | None
+    since: datetime
+    until: datetime
+    # Both directions are always present (empty when nothing crossed that way), so a
+    # reader never has to guard a missing key. Vehicle classes are only those seen.
+    counts: dict[Direction, dict[str, int]]
+    total: int
+
+
+class HourlyBucket(BaseModel):
+    hour: datetime  # start of the hour, UTC
+    total: int
+
+
+class HourlyTotals(BaseModel):
+    """Crossings per UTC hour in `[since, until)`, oldest first.
+
+    Hours with no recorded crossings are absent, not zero: a quiet road and a worker
+    that was down look the same to the database, so the gap is left for the caller
+    to render rather than being papered over with a measured-looking zero.
+    """
+
+    camera_id: str | None
+    since: datetime
+    until: datetime
+    buckets: list[HourlyBucket]
