@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "traffic-ai"
-version = "1.0.0"
+version = "1.1.0"
 description = "Toll-booth and traffic congestion monitoring — real-time vehicle detection, tracking, and counting over demo footage."
 authors = ["bhuiyanmobasshir94"]
 readme = "README.md"
@@ -42,6 +42,28 @@ supervision = { version = ">=0.30,<0.31", optional = true }
 opencv-python-headless = { version = "^4.10", optional = true }
 numpy = { version = "^2.1", optional = true }
 
+# --- persistence ----------------------------------------------------------
+# Postgres is the system of record for crossing history; Redis stays the hot
+# live path (see docs/decisions/DECISIONS.md). The UI never connects to the
+# database — it reads history over HTTP — so these stay out of the `ui` extra.
+sqlalchemy = { version = "^2.0", extras = ["asyncio"], optional = true }
+asyncpg = { version = "^0.30", optional = true }
+alembic = { version = "^1.14", optional = true }
+
+# --- observability --------------------------------------------------------
+prometheus-client = { version = ">=0.21,<1.0", optional = true }
+
+# --- test tooling ---------------------------------------------------------
+# Declared as optional main dependencies rather than a Poetry dev group so the
+# `test` extra below is installable with plain pip. CI and the Makefile both
+# resolve with pip, and a Poetry group is invisible to them.
+pytest = { version = "^9.1", optional = true }
+pytest-asyncio = { version = "^1.4", optional = true }
+ruff = { version = "^0.16", optional = true }
+fakeredis = { version = "^2.37", optional = true }
+pyyaml = { version = "^6.0", optional = true }
+aiosqlite = { version = "^0.21", optional = true }
+
 [tool.poetry.extras]
 ui = ["streamlit", "folium", "streamlit-folium"]
 worker = [
@@ -52,13 +74,32 @@ worker = [
     "supervision",
     "opencv-python-headless",
     "numpy",
+    "sqlalchemy",
+    "asyncpg",
+    "alembic",
+    "prometheus-client",
 ]
-
-[tool.poetry.group.dev.dependencies]
-pytest = "^9.1"
-pytest-asyncio = "^1.4"
-ruff = "^0.16"
-fakeredis = "^2.37"
+# Everything the suite needs to COLLECT and pass, and nothing more. This is
+# deliberately `worker` minus torch/ultralytics/uvicorn: the suite is designed
+# to run with no inference stack (tests/conftest.py), but it does import
+# fastapi, numpy, supervision and cv2 at module scope, so those are required.
+# Installing only `[ui]` leaves six test modules uncollectable.
+test = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+    "fakeredis",
+    "pyyaml",
+    "aiosqlite",
+    "fastapi",
+    "numpy",
+    "supervision",
+    "opencv-python-headless",
+    "sqlalchemy",
+    "asyncpg",
+    "alembic",
+    "prometheus-client",
+]
 
 [build-system]
 requires = ["poetry-core"]
@@ -72,6 +113,7 @@ build-backend = "poetry.core.masonry.api"
 line-length = 100
 target-version = "py312"
 src = ["src", "tests"]
+extend-exclude = ["migrations/versions"]
 
 [tool.ruff.lint]
 select = [
@@ -91,6 +133,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"]  # assert is the point of a test
+"migrations/env.py" = ["E402"]  # alembic's generated import order
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -98,4 +141,5 @@ asyncio_mode = "auto"
 addopts = "-q --strict-markers"
 markers = [
     "requires_inference: needs torch/ultralytics installed (skipped by default)",
+    "requires_postgres: needs a live Postgres via TRAFFIC_AI_TEST_DATABASE_URL (skipped by default)",
 ]
