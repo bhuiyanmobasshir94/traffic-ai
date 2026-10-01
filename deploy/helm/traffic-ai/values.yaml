@@ -245,6 +245,49 @@ ingress:
     enabled: false
     secretName: ""
 
+  # Edge authentication: a human logs in once at the ingress (HTTP BasicAuth),
+  # the way compose.yaml's Traefik does. Off by default; on in
+  # values-production.yaml. Read docs/KUBERNETES.md, "Edge authentication",
+  # before turning it on: what it can and cannot do depends on the controller.
+  #
+  # With ingress-nginx (any className other than "traefik") this adds the
+  # nginx.ingress.kubernetes.io/auth-{type,secret,realm} annotations, which gate
+  # the WHOLE host, /api included. It does NOT inject the API token toward the
+  # worker (that would need a configuration-snippet, which ingress-nginx
+  # disables by default, and the token would sit in an annotation, which is not
+  # secret). The UI's server-side calls are unaffected: the UI pod gets the
+  # token from the same Secret as the worker. Browser-direct /api requests (the
+  # MJPEG video) arrive with the BasicAuth header and the worker rejects them
+  # with 401 unless you take one of the options in the docs.
+  #
+  # With className "traefik" this instead attaches the Middleware CRs named in
+  # `traefik.middlewares`, which is how the compose pattern (BasicAuth, then
+  # inject the bearer) carries over to Kubernetes in full.
+  edgeAuth:
+    enabled: false
+    # ingress-nginx only. A Secret you create in this namespace, with the
+    # htpasswd lines under the key `auth`:
+    #   kubectl -n <ns> create secret generic traffic-ai-basic-auth \
+    #     --from-file=auth=<(htpasswd -nbB admin '<password>')
+    # Referenced by name only; never rendered by this chart. Required when
+    # edgeAuth.enabled and className is not "traefik".
+    secretName: ""
+    # Shown in the browser's login prompt. No double quotes (nginx quotes it).
+    realm: "Traffic AI - Authentication Required"
+
+  # Traefik as the ingress controller (className: traefik). The chart does NOT
+  # template Middleware CRDs: you create them, then name them here. Format is
+  # <namespace>-<name>@kubernetescrd, in execution order. BasicAuth FIRST, then
+  # the bearer injection, for the same reason as compose.yaml: the check must
+  # run against the browser's header before it is replaced. See
+  # docs/KUBERNETES.md for the Middleware YAML.
+  #
+  # One Ingress carries both paths, so this chain also runs for the UI path;
+  # the UI pod then receives a bearer token it already holds. If that is not
+  # acceptable, use two Ingress objects of your own.
+  traefik:
+    middlewares: []
+
 autoscaling:
   # Opt-in. When enabled, this chart sets replicaCount via the HPA instead
   # of worker.replicaCount / ui.replicaCount — leave the Deployment

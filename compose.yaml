@@ -2,16 +2,46 @@
 #
 # traefik terminates TLS on ${DOMAIN} and routes:
 #   Host(${DOMAIN}) && PathPrefix(/api)  -> worker   (higher priority, checked first)
-#   Host(${DOMAIN})                      -> ui        (catch-all)
+#   Host(${DOMAIN})                      -> ui       (catch-all)
 #
-# redis and worker are never published to the host — only traefik binds
-# ports 80/443. See docs/DEPLOYMENT.md for the operator runbook.
+# EDGE AUTHENTICATION. A human logs in once with HTTP BasicAuth at Traefik
+# (users live in ./config/traefik/users.htpasswd, which YOU create — it is
+# gitignored; see docs/DEPLOYMENT.md). Both routers require it. On the /api
+# router Traefik then replaces the Authorization header with
+# `Bearer ${TRAFFIC_AI_API_TOKEN}` before proxying, because the worker accepts
+# only that bearer token and a browser <img> (the MJPEG stream) cannot send
+# one. The browser therefore authenticates with BasicAuth alone and never sees
+# the token.
+#
+# Startup order: postgres healthy -> migrate (one-shot `alembic upgrade head`)
+# -> worker (also needs redis healthy) -> ui.
+#
+# redis, postgres and worker are never published to the host — only traefik
+# binds ports 80/443. See docs/DEPLOYMENT.md for the operator runbook.
+#
+# `deploy.resources` figures are estimates sized for CPU-only inference over two
+# streams, not measurements from a production host. Tune them with
+# `docker stats` (docs/DEPLOYMENT.md, "Resource expectations").
 
 x-logging: &default-logging
   driver: json-file
   options:
     max-size: "10m"
     max-file: "3"
+
+# `worker` and `migrate` run the same image: the migration tool and the
+# revisions ship inside it (docker/Dockerfile.worker), so the schema and the
+# code that expects it can never be built apart.
+x-worker-image: &worker-image
+  build:
+    context: .
+    dockerfile: docker/Dockerfile.worker
+  image: traffic-ai-worker:local
+
+# The one place the database URL is assembled, so migrate and worker cannot
+# disagree about which database they mean. The password lands in a URL: use a
+# hex value (`openssl rand -hex 24`), or percent-encode anything else.
+x-database-url: &database-url "postgresql+asyncpg://${POSTGRES_USER:-traffic}:${POSTGRES_PASSWORD:-traffic}@postgres:5432/${POSTGRES_DB:-traffic_ai}"
 
 services:
   traefik:
@@ -40,12 +70,32 @@ services:
       # is the accepted risk of the Docker provider — see docs/DEPLOYMENT.md.
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - letsencrypt:/letsencrypt
+      # BasicAuth users (htpasswd, bcrypt). A file rather than a label because
+      # a bcrypt hash is full of `$`, which compose would try to interpolate.
+      # Long syntax with create_host_path: false so a MISSING file stops
+      # `docker compose up` with a clear error. The short syntax would have
+      # Docker silently create an empty directory at that path, and Traefik
+      # would then fail to read users from it.
+      - type: bind
+        source: ./config/traefik/users.htpasswd
+        target: /etc/traefik/users.htpasswd
+        read_only: true
+        bind:
+          create_host_path: false
     healthcheck:
       test: ["CMD", "traefik", "healthcheck", "--ping"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.05"
+          memory: 64M
     logging: *default-logging
 
   redis:
@@ -63,21 +113,113 @@ services:
       timeout: 3s
       retries: 5
       start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          # Above --maxmemory 256mb: that cap covers the dataset, not Redis's
+          # own overhead, so the container limit needs headroom over it.
+          memory: 384M
+        reservations:
+          cpus: "0.05"
+          memory: 64M
+    logging: *default-logging
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-traffic}
+      # The default is the DEVELOPMENT password on purpose. The worker's
+      # production gate (traffic_ai.config.Settings) refuses to start while the
+      # database URL still contains it, so forgetting to set a real password in
+      # .env stops the deployment instead of shipping a guessable one.
+      #
+      # Postgres reads this once, when it first initialises the data volume.
+      # Changing it later does NOT change the role's password — see
+      # docs/DEPLOYMENT.md, "Troubleshooting".
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-traffic}
+      POSTGRES_DB: ${POSTGRES_DB:-traffic_ai}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # $$ so compose leaves the variables for the container's shell to expand.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+    logging: *default-logging
+    # Not directly reachable — no `ports:`. Only migrate and worker connect to
+    # it, over the compose-internal network.
+
+  migrate:
+    <<: *worker-image
+    # One-shot: runs to completion and stays exited. Failure is visible —
+    # `docker compose ps -a` shows a non-zero exit and the worker never starts
+    # against a schema that was not brought up to date.
+    restart: "no"
+    # The image's ENTRYPOINT is the API server (`python -m traffic_ai.api`), so
+    # `command:` alone would be appended to it. Replace the entrypoint.
+    # alembic.ini and migrations/ sit in the image's WORKDIR (/app).
+    entrypoint: ["alembic"]
+    command: ["upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Same environment as the worker, so the same production gate applies: a
+      # missing token or a development-password URL fails HERE, before the
+      # worker. alembic reads only the database URL; the token is required by
+      # the settings validation, not used.
+      TRAFFIC_AI_ENVIRONMENT: production
+      TRAFFIC_AI_LOG_LEVEL: ${TRAFFIC_AI_LOG_LEVEL:-INFO}
+      TRAFFIC_AI_LOG_FORMAT: ${TRAFFIC_AI_LOG_FORMAT:-json}
+      TRAFFIC_AI_DATABASE_URL: *database-url
+      TRAFFIC_AI_API_TOKEN: ${TRAFFIC_AI_API_TOKEN:-}
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.05"
+          memory: 64M
     logging: *default-logging
 
   worker:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.worker
+    <<: *worker-image
     restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
+      # Not merely "started": the schema must be current before the writer's
+      # first flush, and a failed migration must leave the worker down.
+      migrate:
+        condition: service_completed_successfully
     environment:
       TRAFFIC_AI_ENVIRONMENT: production
       TRAFFIC_AI_LOG_LEVEL: ${TRAFFIC_AI_LOG_LEVEL:-INFO}
       TRAFFIC_AI_LOG_FORMAT: ${TRAFFIC_AI_LOG_FORMAT:-json}
       TRAFFIC_AI_REDIS_URL: redis://redis:6379/0
+      TRAFFIC_AI_DATABASE_URL: *database-url
+      # Blank when unset. Settings treats a blank token as no token, so with
+      # TRAFFIC_AI_ENVIRONMENT=production the worker refuses to start rather
+      # than accept an empty bearer. There is deliberately no default value.
+      TRAFFIC_AI_API_TOKEN: ${TRAFFIC_AI_API_TOKEN:-}
+      # On by default. Off keeps the live dashboard and drops history; the
+      # migrate service still runs, since the schema is cheap to keep current.
+      TRAFFIC_AI_PERSISTENCE_ENABLED: ${TRAFFIC_AI_PERSISTENCE_ENABLED:-true}
       TRAFFIC_AI_VIDEO_DIR: /data/videos
       TRAFFIC_AI_MODEL_WEIGHTS: ${TRAFFIC_AI_MODEL_WEIGHTS:-/app/weights/yolov8n.pt}
       TRAFFIC_AI_DEVICE: ${TRAFFIC_AI_DEVICE:-cpu}
@@ -99,6 +241,16 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    deploy:
+      resources:
+        limits:
+          # CPU inference is the dominant cost. Two streams at target_fps=12
+          # with detect_every_n_frames=2 keep roughly two cores busy.
+          cpus: "2.0"
+          memory: 3G
+        reservations:
+          cpus: "1.0"
+          memory: 1G
     labels:
       - traefik.enable=true
       - traefik.http.routers.worker.rule=Host(`${DOMAIN}`) && PathPrefix(`/api`)
@@ -107,7 +259,32 @@ services:
       # Explicit and higher than the ui router's — PathPrefix(/api) must win
       # over the catch-all Host() rule regardless of rule-length ordering.
       - traefik.http.routers.worker.priority=100
+      # ORDER MATTERS: Traefik runs these left to right. worker-basicauth
+      # first, so nothing reaches the token step without a valid login;
+      # api-bearer second, so the Authorization header the browser sent
+      # (Basic ...) is replaced by the service token only for a request that
+      # has already passed. Reversed, the login check would run against a
+      # header the token step had already overwritten.
+      - traefik.http.routers.worker.middlewares=worker-basicauth@docker,api-bearer@docker
       - traefik.http.services.worker.loadbalancer.server.port=8000
+      # --- middleware definitions -----------------------------------------
+      # Each router owns its BasicAuth middleware, defined in its own
+      # container's labels, instead of sharing one. A middleware definition
+      # exists only while its container does; with a shared one, stopping the
+      # worker would take the UI's login with it and the UI would 404 instead
+      # of showing its "stale" banner. (A router that names a middleware
+      # Traefik cannot find is not served at all, so this fails closed, never
+      # open — but closed is still an outage.)
+      - traefik.http.middlewares.worker-basicauth.basicauth.usersfile=/etc/traefik/users.htpasswd
+      - traefik.http.middlewares.worker-basicauth.basicauth.realm=Traffic AI
+      # Do not forward the browser's Basic credentials to the upstream.
+      - traefik.http.middlewares.worker-basicauth.basicauth.removeheader=true
+      # Sets the bearer the worker's AuthMiddleware expects. The token is
+      # interpolated from the environment, never written in this file. It does
+      # become part of the container's labels, readable by anyone who can run
+      # `docker inspect` — the same people who can already read the container's
+      # environment, and who are root-equivalent on this host anyway.
+      - traefik.http.middlewares.api-bearer.headers.customrequestheaders.Authorization=Bearer ${TRAFFIC_AI_API_TOKEN:-}
     logging: *default-logging
     # Not directly reachable — no `ports:`. Traefik proxies to it over the
     # compose-internal network only.
@@ -125,12 +302,25 @@ services:
       TRAFFIC_AI_LOG_LEVEL: ${TRAFFIC_AI_LOG_LEVEL:-INFO}
       TRAFFIC_AI_LOG_FORMAT: ${TRAFFIC_AI_LOG_FORMAT:-json}
       TRAFFIC_AI_REDIS_URL: redis://redis:6379/0
+      # The UI calls the worker server-to-server, bypassing Traefik, so it
+      # presents the token itself. Same value, same blank-means-unset rule as
+      # the worker's. (Settings applies the production gate to this process
+      # too: without a token it refuses to start.)
+      TRAFFIC_AI_API_TOKEN: ${TRAFFIC_AI_API_TOKEN:-}
+      # The UI never connects to the database — it reads history over HTTP — so
+      # it is given no database credentials. Turning persistence off here is
+      # what stops the production gate asking for a database URL it does not
+      # use. Without this, Settings would refuse to start the UI on the
+      # development-password default.
+      TRAFFIC_AI_PERSISTENCE_ENABLED: "false"
       # Server-to-server default (traffic_ai.config.Settings.api_internal_url)
       # already resolves to this; set explicitly so it survives a settings
       # default change without editing compose.yaml.
       TRAFFIC_AI_API_INTERNAL_URL: http://worker:8000
       # Browser-facing: relative, so it rides the same Host/TLS as the UI —
-      # one DNS record, one certificate, no CORS.
+      # one DNS record, one certificate, no CORS. The browser's MJPEG <img>
+      # sends the BasicAuth credentials it cached for this host; Traefik swaps
+      # them for the bearer token (see the worker router).
       TRAFFIC_AI_API_PUBLIC_URL: /api
     healthcheck:
       test:
@@ -142,13 +332,44 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 256M
     labels:
       - traefik.enable=true
       - traefik.http.routers.ui.rule=Host(`${DOMAIN}`)
       - traefik.http.routers.ui.entrypoints=websecure
       - traefik.http.routers.ui.tls.certresolver=le
       - traefik.http.routers.ui.priority=1
+      # Headers first, so the 401 login challenge carries them too (HSTS on the
+      # very first response is the useful one); then BasicAuth.
+      - traefik.http.routers.ui.middlewares=ui-security-headers@docker,ui-basicauth@docker
       - traefik.http.services.ui.loadbalancer.server.port=8501
+      # --- BasicAuth ------------------------------------------------------
+      # Same users file as the worker router; defined here, not shared — see
+      # the note on the worker's middleware definitions.
+      - traefik.http.middlewares.ui-basicauth.basicauth.usersfile=/etc/traefik/users.htpasswd
+      - traefik.http.middlewares.ui-basicauth.basicauth.realm=Traffic AI
+      - traefik.http.middlewares.ui-basicauth.basicauth.removeheader=true
+      # --- security headers -------------------------------------------------
+      - traefik.http.middlewares.ui-security-headers.headers.stsseconds=31536000
+      - traefik.http.middlewares.ui-security-headers.headers.stsincludesubdomains=true
+      - traefik.http.middlewares.ui-security-headers.headers.contenttypenosniff=true
+      - traefik.http.middlewares.ui-security-headers.headers.referrerpolicy=no-referrer
+      # SAMEORIGIN, not DENY. Streamlit components (st_folium draws the map)
+      # render in same-origin iframes; X-Frame-Options: DENY would block them.
+      # SAMEORIGIN still stops any other site framing the dashboard, which is
+      # the clickjacking protection that was wanted.
+      - traefik.http.middlewares.ui-security-headers.headers.customframeoptionsvalue=SAMEORIGIN
+      # No Content-Security-Policy on purpose. Streamlit ships inline scripts
+      # and styles, so a strict policy breaks the app, and a loosened one
+      # ('unsafe-inline') adds little. Do not add one here without testing the
+      # dashboard in a browser.
     logging: *default-logging
     # Not directly reachable — no `ports:`. Traefik proxies to it (including
     # the /_stcore/stream WebSocket upgrade — see docs/DEPLOYMENT.md).
@@ -156,3 +377,4 @@ services:
 volumes:
   letsencrypt:
   model-weights:
+  postgres-data:

@@ -11,10 +11,12 @@ The chart was verified with `helm lint`, `helm template`, and the structural
 tests in `tests/test_helm_chart.py`. It has **not** been installed on a live
 cluster; see "What is and is not verified" at the end before relying on it.
 
-Verified against branch `production-hardening` (base commit `a70d210` plus
+Verified against branch `production-hardening` (base commit `5c67d11` plus
 uncommitted working-tree changes) on 2026-10-01, with Helm v4.3.0. The
 settings contract it mirrors is `src/traffic_ai/config.py` and
-`compose.yaml` as of that commit.
+`compose.yaml` as of that state. Anything not exercised by `helm lint`,
+`helm template`, or `tests/test_helm_chart.py` is marked unverified where it
+appears.
 
 ## What the chart deploys
 
@@ -23,7 +25,7 @@ settings contract it mirrors is `src/traffic_ai/config.py` and
 | `Deployment` `<release>-worker` | FastAPI + CPU inference, port 8000 | `worker` |
 | `Deployment` `<release>-ui` | Streamlit, port 8501 | `ui` |
 | `Service` x2 (`ClusterIP`) | In-cluster addressing; nothing is exposed directly | the compose network |
-| `Ingress` | One host; `/api` to the worker, `/` to the UI | Traefik routers |
+| `Ingress` | One host; `/api` to the worker, `/` to the UI; optional edge login (see "Edge authentication") | Traefik routers and middlewares |
 | `ConfigMap` x2 | Non-secret `TRAFFIC_AI_*` settings | `environment:` blocks |
 | `Secret` (optional) | Only if you do not name an existing one | `.env` |
 | `ServiceAccount` | Identity only; no token mounted, no RBAC | n/a |
@@ -38,7 +40,9 @@ ingress controller and your certificate process.
 - A Kubernetes cluster and `kubectl` / `helm` (v3 or v4) pointed at it.
 - An ingress controller. The chart defaults to `ingressClassName: nginx` and
   `values-production.yaml` carries ingress-nginx annotations; any controller
-  works, but see "Ingress" for how `/api` priority differs between them.
+  works, but see "Ingress" for how `/api` priority differs between them. The
+  controller also decides how much of the edge login can work: read "Edge
+  authentication" before choosing.
 - A TLS certificate for your host as a `kubernetes.io/tls` Secret, or a
   certificate manager that produces one. The chart installs neither cert-manager
   nor its CRDs.
@@ -88,9 +92,13 @@ kubectl -n traffic-ai create secret generic traffic-ai-secrets \
 `values-production.yaml` already sets `auth.existingSecret: traffic-ai-secrets`
 with the keys `api-token` and `database-url`. Different key names are
 configurable via `auth.existingSecretTokenKey` and
-`auth.existingSecretDatabaseUrlKey`. Only the worker receives these; the UI
-holds neither (matching `compose.yaml`: the UI never connects to the database
-and reads history over HTTP).
+`auth.existingSecretDatabaseUrlKey`. The worker receives both. The UI receives
+**only the token**, from the same Secret and key: it calls the worker
+server-to-server, bypassing the ingress, so it has to present the bearer itself.
+It is given no database URL (matching `compose.yaml`: the UI never connects to
+the database and reads history over HTTP), and its ConfigMap sets
+`TRAFFIC_AI_PERSISTENCE_ENABLED=false` so the production gate does not ask it for
+one. Without the token the UI would refuse to start, exactly as the worker does.
 
 When `existingSecret` is set the references are *required*: a wrong Secret name
 or key leaves the pod in `CreateContainerConfigError` with the missing name in
@@ -166,8 +174,13 @@ suit an in-cluster release.
    curl -fsS https://traffic.example.org/api/readyz
    ```
 
-   Both probe paths are exempt from the API token (a load balancer cannot
-   present credentials). Everything else under `/api` is token-protected.
+   Both probe paths are exempt from the API *token* (a load balancer cannot
+   present credentials). Everything else under `/api` is token-protected. If you
+   turned on edge authentication (`values-production.yaml` does), the ingress
+   gates the whole host first, probe paths included, so add `-u admin` (curl
+   prompts for the password). The kubelet's own probes hit the pod directly and
+   are unaffected; an *external* uptime monitor needs the BasicAuth credentials
+   or must be pointed at something else.
 
 ## Probes
 
@@ -210,6 +223,199 @@ Network tab, anything in front of the proxy stripping `Upgrade`) is identical.
 
 TLS is `ingress.tls.enabled` plus `ingress.tls.secretName`. The ingress template
 refuses to render with TLS enabled and no secret name.
+
+## Edge authentication
+
+**The problem.** The worker's `AuthMiddleware` requires
+`Authorization: Bearer <token>` on every `/api` path except the two probe paths.
+That includes the MJPEG video stream, which the browser loads directly through an
+`<img>` tag, and an `<img>` cannot attach a header. `src/traffic_ai/config.py`
+describes the intended model: a human logs in **once at the edge**, and the edge
+supplies the bearer toward the worker; the token is for scripts and for the UI's
+own server-to-server calls. `compose.yaml` does exactly that with Traefik
+(BasicAuth, then inject `Authorization: Bearer ...`), so the browser never sees
+the token.
+
+**What this chart can do about it depends on the controller.**
+
+| | ingress-nginx | Traefik |
+| --- | --- | --- |
+| Human login at the edge (BasicAuth) | yes | yes |
+| UI server-side calls to the worker (token from the Secret) | yes | yes |
+| Browser-direct `/api`, i.e. the live video | **no, 401** unless you take option (a) or (b) below | yes |
+
+The token is injected toward the worker only where a controller can do it without
+a configuration snippet. ingress-nginx disables snippets by default, and an
+Ingress annotation would put the token in plain sight (annotations are not
+secret and are printed by `helm template` and `kubectl get ingress -o yaml`), so
+this chart never does it.
+
+### ingress-nginx
+
+```yaml
+ingress:
+  edgeAuth:
+    enabled: true
+    secretName: traffic-ai-basic-auth   # a Secret you create; the chart never renders it
+    realm: "Traffic AI - Authentication Required"
+  tls:
+    enabled: true       # required: BasicAuth over plain HTTP sends the password in clear
+    secretName: traffic-ai-tls
+```
+
+`values-production.yaml` already enables this. Create the Secret first, with the
+htpasswd lines under the key **`auth`**:
+
+```bash
+kubectl -n traffic-ai create secret generic traffic-ai-basic-auth \
+  --from-file=auth=<(htpasswd -nbB admin '<password>')
+```
+
+This sets `nginx.ingress.kubernetes.io/auth-type: basic`, `auth-secret`, and
+`auth-realm` on the Ingress. They apply to the **whole host**, `/api` included, so
+an unauthenticated request to any path is a 401 from the controller before it
+reaches a pod. The chart refuses to render if the Secret name is missing, or if
+TLS is off.
+
+**The gap.** nginx forwards the browser's `Authorization: Basic ...` header to the
+worker unchanged. The worker wants a bearer, so it answers the browser-direct
+`/api` requests with 401, and the dashboard's video does not play (the rest of
+the page works: its numbers come through the UI pod's server-side calls). Pick one
+before putting this in front of real users:
+
+- **(a) Accept an edge-only API.** The login is then the only gate on `/api`.
+  Create the existing Secret with an **empty** `api-token` value
+  (`--from-literal=api-token=`) and set `auth.allowUnauthenticated=true`. A blank
+  token counts as no token, so `AuthMiddleware` is not installed, and the worker
+  ignores the Basic header it receives. The tradeoff is real: anything that can
+  reach the worker's port without going through the ingress is unauthenticated,
+  which is why this is only reasonable with `networkPolicy.enabled=true` (UI pods
+  and the ingress controller only). Programmatic clients lose their bearer-token
+  path. This is the opposite of fail-closed by default; it has to be chosen.
+- **(b) Put a forward-auth or reverse proxy in front of `/api`** that you operate,
+  which authenticates the human and sets `Authorization: Bearer <token>` toward
+  the worker. This chart does not provide one, and **this option was not tried**.
+- **(c) Use Traefik as the ingress controller**, below. It is the only option here
+  that keeps the worker token-protected *and* the video working, and it is the
+  same pattern `compose.yaml` runs.
+
+A configuration snippet that sets the header would also work on a controller that
+allows snippets. It is deliberately not offered: the token would live in an
+Ingress annotation, visible to anyone who can read Ingress objects and printed by
+`helm template`.
+
+### Traefik
+
+Set the class and name the Middleware CRs you create. The chart **does not
+template CRDs**; it only references them, so it renders on a cluster without the
+Traefik CRDs.
+
+```yaml
+ingress:
+  className: traefik
+  edgeAuth:
+    enabled: true
+  tls:
+    enabled: true
+    secretName: traffic-ai-tls
+  traefik:
+    # <namespace>-<name>@kubernetescrd, in execution order.
+    middlewares:
+      - traffic-ai-basicauth@kubernetescrd
+      - traffic-ai-api-bearer@kubernetescrd
+```
+
+That renders `traefik.ingress.kubernetes.io/router.middlewares:
+traffic-ai-basicauth@kubernetescrd,traffic-ai-api-bearer@kubernetescrd`, and the
+chart refuses to render if `edgeAuth.enabled` is set with an empty list. **Order
+matters**, for the same reason as in `compose.yaml`: BasicAuth consumes the
+browser's `Authorization` header first, and only a request that has passed is
+given the service token in its place. Reversed, the login check would run against
+a header that had already been overwritten.
+
+The two Middleware CRs, created out of band in the release namespace (this YAML
+is **unverified**: no cluster was available, and Traefik's CRD fields are as
+documented for Traefik v3 at the time of writing. Run
+`kubectl apply --dry-run=server` first):
+
+```yaml
+# basicauth.yaml
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: basicauth
+  namespace: traffic-ai
+spec:
+  basicAuth:
+    secret: traffic-ai-traefik-users   # Secret with the htpasswd lines under the key `users`
+    realm: Traffic AI
+    removeHeader: true                 # do not forward the browser's Basic credentials
+---
+# api-bearer.yaml  (keep out of git: it carries the token)
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: api-bearer
+  namespace: traffic-ai
+spec:
+  headers:
+    customRequestHeaders:
+      Authorization: "Bearer REPLACE_WITH_TOKEN"
+```
+
+```bash
+# Traefik's BasicAuth Secret uses the key `users` (ingress-nginx uses `auth`).
+kubectl -n traffic-ai create secret generic traffic-ai-traefik-users \
+  --from-file=users=<(htpasswd -nbB admin '<password>')
+
+kubectl apply -f basicauth.yaml
+
+# Substitute the real token at apply time; never commit it.
+TOKEN="$(kubectl -n traffic-ai get secret traffic-ai-secrets \
+  -o jsonpath='{.data.api-token}' | base64 -d)"
+sed "s|REPLACE_WITH_TOKEN|${TOKEN}|" api-bearer.yaml | kubectl apply -f -
+```
+
+**The token sits in clear text in the `api-bearer` Middleware.** To our knowledge
+Traefik's `headers` middleware takes literal values and has no Secret reference
+for them, so this is the one place the token is not in a Secret. Anyone who can
+`get` `middlewares.traefik.io` in that namespace can read it. Restrict that RBAC,
+do not commit the manifest, and when you rotate the token, update the Secret,
+re-apply the Middleware, and restart both Deployments (`kubectl -n traffic-ai
+rollout restart deploy/traffic-ai-worker deploy/traffic-ai-ui`). It is the same
+exposure `compose.yaml` has (the token appears in the worker's container labels),
+and it is why the chart does not render it.
+
+One Ingress carries both paths, so the middleware chain also runs for the UI path:
+the UI pod receives a bearer token it already holds from its own Secret. That is
+harmless, but if you want the token on `/api` only, create two Ingress objects of
+your own instead of using this value.
+
+With Traefik as the controller, point the NetworkPolicy at it:
+
+```yaml
+networkPolicy:
+  ingressControllerNamespaceSelector:
+    kubernetes.io/metadata.name: traefik       # wherever Traefik runs
+  ingressControllerPodSelector:
+    app.kubernetes.io/name: traefik
+```
+
+### Check that it is enforced
+
+The check that matters is the negative one: a request with no credentials must be
+refused, and a controller that ignores the annotation fails open silently.
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' https://traffic.example.org/           # expect 401
+curl -s -o /dev/null -w '%{http_code}\n' https://traffic.example.org/api/cameras  # expect 401
+curl -s -o /dev/null -w '%{http_code}\n' -u admin https://traffic.example.org/api/cameras
+#   Traefik: 200.   ingress-nginx: 401 (the gap above, from the worker, not the edge)
+```
+
+A `200` on the first two means the controller is not enforcing the annotations.
+That happens when `ingressClassName` names a controller that does not understand
+them, which is why the chart cannot make this check for you.
 
 ## Resource expectations
 
@@ -358,8 +564,22 @@ route to the worker Service. Confirm your controller's behaviour for overlapping
 the browser and the pods is closing the WebSocket or MJPEG connection. Raise the
 controller's read/send timeouts (see "Ingress").
 
-**`/api/...` returns 401 from the browser.** See "Open question: browser access
-with an API token" below.
+**`/api/...` returns 401 from the browser, and the video does not play.** On
+ingress-nginx with edge authentication this is the known gap: the controller
+passes the BasicAuth header through and the worker wants a bearer. See "Edge
+authentication" for options (a) to (c). Check where the 401 comes from: the
+worker's body is `{"detail":"Unauthorized"}` with `WWW-Authenticate: Bearer`; the
+controller's is an HTML page with `WWW-Authenticate: Basic`.
+
+**`helm template` fails with "ingress.edgeAuth.secretName is required",
+"requires ingress.tls.enabled", or "ingress.traefik.middlewares is required".**
+Edge authentication was enabled without what would enforce it. Each is a deliberate
+refusal to render an Ingress that looks protected and is not.
+
+**Everything under `/` and `/api` is 200 with no credentials although edge
+authentication is on.** The controller is not enforcing the annotations, usually
+because `ingressClassName` names a different controller than the one the
+annotations are written for. See "Check that it is enforced".
 
 **`helm template` fails with "ingress.host is required".** You used
 `values-production.yaml` without `--set ingress.host=...`. That is intentional.
@@ -377,9 +597,14 @@ evicted (briefly unavailable) during maintenance.
 ## What is and is not verified
 
 Verified here: `helm lint`, `helm template` for the default values, for
-`values-production.yaml`, and with `autoscaling.enabled`,
-`podDisruptionBudget.enabled`, and `networkPolicy.enabled`, plus the structural
-assertions in `tests/test_helm_chart.py`.
+`values-production.yaml`, with `ingress.className=traefik`, and with
+`autoscaling.enabled`, `podDisruptionBudget.enabled`, and `networkPolicy.enabled`,
+plus the structural assertions in `tests/test_helm_chart.py`: the annotations each
+controller mode renders, the middleware order, that no token or snippet reaches the
+Ingress, and that the rendered UI and worker ConfigMaps (plus their Secret-backed
+variables) are accepted by the real `Settings` production gate. Option (a)'s claim
+(an empty token with `allowUnauthenticated` starts both processes with the API
+open) was checked against `Settings` directly.
 
 **Not verified:**
 
@@ -391,17 +616,24 @@ assertions in `tests/test_helm_chart.py`.
   "read-only file system" error, the log names the path to add as another
   `emptyDir`. Do not set the flag to `false` as the fix.
 - NetworkPolicy enforcement, which depends on your CNI.
+- **Edge authentication on a live controller.** No ingress-nginx or Traefik was
+  running, so neither the BasicAuth challenge, the 401 on unauthenticated
+  requests, nor the header injection was observed. The annotation names are
+  ingress-nginx's and Traefik's documented ones; the ingress-nginx and Traefik
+  Secret key names (`auth` and `users`) and the Middleware CR schema are from
+  their documentation, not from a cluster. Run "Check that it is enforced" after
+  installing.
+- **The ingress-nginx video gap** is derived from reading the worker's
+  `AuthMiddleware` and from nginx forwarding the `Authorization` header by
+  default; it was not reproduced in a cluster.
+- **Option (b)** (a forward-auth or reverse proxy that injects the bearer) is a
+  suggestion, not something this chart provides or that was tried.
 
-### Open question: browser access with an API token
+### Decision for the operator: how browsers reach `/api`
 
-The worker's `AuthMiddleware` requires the bearer token on every `/api` path
-except the two probe paths, including the MJPEG stream the browser loads
-directly. The UI does not send a token (`compose.yaml` gives it none), and a
-browser `<img>` cannot attach an `Authorization` header. So with a token set and
-nothing at the edge adding the header, a browser-direct `/api` request is
-rejected with 401. `src/traffic_ai/config.py` describes the intended model as
-edge authentication for browsers (Traefik BasicAuth in Compose) and the token
-for scripts. This chart does not add an equivalent edge-auth layer; configure
-one on your ingress controller, and do not put the token itself into an Ingress
-annotation (annotations are not secret). This needs a decision before exposing
-the dashboard to real users.
+`values-production.yaml` turns edge authentication on for ingress-nginx, which
+secures the dashboard but leaves the live video returning 401. That needs a
+decision before real users see it: run Traefik (option (c), the complete
+equivalent of `compose.yaml`), accept an edge-only API (option (a), with the
+tradeoff stated above), or front `/api` with your own proxy (option (b)). The
+chart will not pick one for you, and it will not put the token in an annotation.

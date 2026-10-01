@@ -16,6 +16,9 @@ spec:
     metadata:
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if not .Values.auth.existingSecret }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -44,15 +47,26 @@ spec:
             - name: http
               containerPort: {{ .Values.ui.containerPort }}
               protocol: TCP
-          # The UI never connects to the database and holds no API token
-          # (compose.yaml gives it neither): it is a thin viewer over HTTP.
           envFrom:
             - configMapRef:
                 name: {{ include "traffic-ai.ui.fullname" . }}
-          {{- with .Values.ui.extraEnv }}
           env:
+            # The UI calls the worker server-to-server (bypassing the ingress),
+            # so it presents the API token itself, from the same Secret as the
+            # worker (compose.yaml does the same). It never connects to the
+            # database and is given no database URL. Required references with
+            # `auth.existingSecret`; optional with the generated Secret, so an
+            # unset value reaches Settings, which refuses to start in
+            # production and says why.
+            - name: TRAFFIC_AI_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "traffic-ai.secretName" . }}
+                  key: {{ include "traffic-ai.secretTokenKey" . }}
+                  optional: {{ not .Values.auth.existingSecret }}
+            {{- with .Values.ui.extraEnv }}
             {{- toYaml . | nindent 12 }}
-          {{- end }}
+            {{- end }}
           livenessProbe:
             httpGet:
               path: {{ .Values.ui.livenessProbe.path }}

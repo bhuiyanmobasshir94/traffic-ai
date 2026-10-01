@@ -5,8 +5,11 @@ nothing is installed — then parse the rendered manifests and assert the
 invariants docs/KUBERNETES.md and CLAUDE.md's non-negotiables depend on: both
 Deployments exist on the right ports, every container is non-root with a
 read-only root filesystem and has requests AND limits, probes hit the paths the
-worker and UI actually serve, `/api` is declared before `/` on the ingress, and
-no secret value is ever rendered when an existing Secret is used.
+worker and UI actually serve, `/api` is declared before `/` on the ingress, edge
+authentication is wired per controller (ingress-nginx annotations, or an ordered
+Traefik middleware chain) and refuses to render half-configured, and no secret
+value is ever rendered when an existing Secret is used. The rendered ConfigMaps
+are also fed into the real `Settings` production gate.
 
 Skipped cleanly where `helm` is not installed, so the suite still passes on a
 laptop or CI runner without it.
@@ -14,12 +17,15 @@ laptop or CI runner without it.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 import yaml
+
+from traffic_ai.config import Settings
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CHART = REPO_ROOT / "deploy" / "helm" / "traffic-ai"
@@ -52,11 +58,36 @@ RECOMMENDED_LABELS = frozenset(
 TOKEN_SENTINEL = "sentinel-api-token-DO-NOT-RENDER"  # noqa: S105 - a test canary, not a credential
 DB_URL_SENTINEL = "postgresql+asyncpg://u:sentinel-db-password-DO-NOT-RENDER@db/traffic_ai"
 
-# The same two scenarios the chart is documented to be deployed in.
+# Names a Middleware CR the operator creates; the chart only references them.
+TRAEFIK_MIDDLEWARES = [
+    "traffic-ai-basicauth@kubernetescrd",
+    "traffic-ai-api-bearer@kubernetescrd",
+]
+_PRODUCTION = ["-f", str(PRODUCTION_VALUES), "--set", "ingress.host=traffic.example.org"]
+_TRAEFIK = [
+    "--set",
+    "ingress.className=traefik",
+    *(
+        arg
+        for i, name in enumerate(TRAEFIK_MIDDLEWARES)
+        for arg in ("--set", f"ingress.traefik.middlewares[{i}]={name}")
+    ),
+]
+
+# The shapes the chart is documented to be deployed in.
 SCENARIOS: dict[str, list[str]] = {
     "default": [],
-    "production": ["-f", str(PRODUCTION_VALUES), "--set", "ingress.host=traffic.example.org"],
+    "production": _PRODUCTION,
+    # Production values with Traefik as the ingress controller (edge auth via
+    # user-created Middleware CRs). Every structural test below runs against it too.
+    "traefik": [*_PRODUCTION, *_TRAEFIK],
 }
+
+NGINX_AUTH_PREFIX = "nginx.ingress.kubernetes.io/auth-"
+TRAEFIK_MIDDLEWARES_ANNOTATION = "traefik.ingress.kubernetes.io/router.middlewares"
+# Enough to satisfy MIN_API_TOKEN_LENGTH; the value only has to be accepted.
+GATE_TOKEN = "t" * 64
+GATE_DB_URL = "postgresql+asyncpg://u:a-real-database-password@db/traffic_ai"
 
 
 def _helm(*args: str) -> subprocess.CompletedProcess[str]:
@@ -99,6 +130,28 @@ def _containers(deployment: dict) -> list[dict]:
 
 def _env(container: dict) -> dict[str, dict]:
     return {e["name"]: e for e in container.get("env", [])}
+
+
+def _ingress(*extra: str) -> dict:
+    (ingress,) = _of_kind(_template(*extra), "Ingress")
+    return ingress
+
+
+def _annotations(ingress: dict) -> dict[str, str]:
+    return ingress["metadata"].get("annotations", {})
+
+
+def _gate_settings(
+    monkeypatch: pytest.MonkeyPatch, configmap: dict, extra: dict[str, str]
+) -> Settings:
+    """Build `Settings` the way the pod would: ConfigMap plus the Secret-backed env."""
+    # Start from a clean TRAFFIC_AI_* slate so ambient variables cannot change the result.
+    for key in [k for k in os.environ if k.startswith("TRAFFIC_AI_")]:
+        monkeypatch.delenv(key)
+    for key, value in {**configmap["data"], **extra}.items():
+        if key.startswith("TRAFFIC_AI_"):
+            monkeypatch.setenv(key, value)
+    return Settings(_env_file=None)
 
 
 @pytest.fixture(scope="module", params=list(SCENARIOS), ids=list(SCENARIOS))
@@ -277,6 +330,10 @@ class TestEnvironmentContract:
         assert data["TRAFFIC_AI_ENVIRONMENT"] == "production"
         assert data["TRAFFIC_AI_API_INTERNAL_URL"] == f"http://{WORKER}:8000"
         assert data["TRAFFIC_AI_API_PUBLIC_URL"] == "/api"
+        # No database URL reaches the UI, so persistence must be off for it or the
+        # production gate would reject the development-password default.
+        assert data["TRAFFIC_AI_PERSISTENCE_ENABLED"] == "false"
+        assert data["TRAFFIC_AI_ALLOW_UNAUTHENTICATED"] == "false"
 
     def test_workloads_load_their_own_configmap(self, worker: dict, ui: dict) -> None:
         for deployment, name in ((worker, WORKER), (ui, UI)):
@@ -292,11 +349,73 @@ class TestEnvironmentContract:
             assert "secretKeyRef" in env[name]["valueFrom"], name
             assert "value" not in env[name], f"{name} must not be a literal"
 
-    def test_ui_holds_no_secret(self, ui: dict) -> None:
-        # compose.yaml gives the UI neither a token nor a database URL: it is a
-        # thin viewer over HTTP and never connects to the database.
+    def test_ui_references_only_the_api_token_secret_key(self, ui: dict) -> None:
+        # compose.yaml gives the UI the token (its server-side calls to the
+        # worker present it) and no database URL: it is a thin viewer over HTTP.
+        # So the ONLY Secret reference the UI pod may carry is the token key, and
+        # it is always a secretKeyRef, never a literal.
         (container,) = _containers(ui)
-        assert "secretKeyRef" not in str(container.get("env", []))
+        env = _env(container)
+        token = env["TRAFFIC_AI_API_TOKEN"]
+        assert "value" not in token, "the token must not be a literal"
+        assert token["valueFrom"]["secretKeyRef"]["key"] == "api-token"
+
+        secret_refs = {
+            e["name"]: e["valueFrom"]["secretKeyRef"]["key"]
+            for e in container.get("env", [])
+            if "secretKeyRef" in e.get("valueFrom", {})
+        }
+        assert secret_refs == {"TRAFFIC_AI_API_TOKEN": "api-token"}
+
+        # No database URL by any route: not as an env var, not via a Secret key,
+        # not through envFrom (which here is the ConfigMap only).
+        assert "TRAFFIC_AI_DATABASE_URL" not in env
+        assert "database-url" not in str(ui["spec"]["template"]["spec"])
+        assert container["envFrom"] == [{"configMapRef": {"name": UI}}]
+
+    def test_ui_and_worker_read_the_token_from_the_same_secret_key(
+        self, worker: dict, ui: dict
+    ) -> None:
+        (worker_container,) = _containers(worker)
+        (ui_container,) = _containers(ui)
+        worker_ref = _env(worker_container)["TRAFFIC_AI_API_TOKEN"]["valueFrom"]["secretKeyRef"]
+        ui_ref = _env(ui_container)["TRAFFIC_AI_API_TOKEN"]["valueFrom"]["secretKeyRef"]
+        assert ui_ref == worker_ref
+
+    def test_ui_token_reference_is_required_with_an_existing_secret(self) -> None:
+        docs = _template(*SCENARIOS["production"])
+        (container,) = _containers(_named(docs, "Deployment", UI))
+        ref = _env(container)["TRAFFIC_AI_API_TOKEN"]["valueFrom"]["secretKeyRef"]
+        assert ref["name"] == "traffic-ai-secrets"
+        assert ref["optional"] is False, "a wrong secret name must stop the pod loudly"
+
+    def test_rendered_ui_environment_passes_the_production_gate(
+        self, docs: list[dict], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The ConfigMap plus the one Secret-backed variable is everything the UI
+        # pod gets. Hold it to the real Settings validation, not to its own strings.
+        configmap = _named(docs, "ConfigMap", UI)
+        settings = _gate_settings(monkeypatch, configmap, {"TRAFFIC_AI_API_TOKEN": GATE_TOKEN})
+        assert settings.is_production
+        assert settings.auth_enabled
+        assert not settings.persistence_enabled
+
+    def test_rendered_ui_environment_without_the_token_is_refused(
+        self, docs: list[dict], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Proves the token wiring above is load-bearing, not decoration.
+        configmap = _named(docs, "ConfigMap", UI)
+        with pytest.raises(ValueError, match="TRAFFIC_AI_API_TOKEN is unset"):
+            _gate_settings(monkeypatch, configmap, {})
+
+    def test_rendered_worker_environment_passes_the_production_gate(
+        self, docs: list[dict], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        configmap = _named(docs, "ConfigMap", WORKER)
+        extra = {"TRAFFIC_AI_API_TOKEN": GATE_TOKEN, "TRAFFIC_AI_DATABASE_URL": GATE_DB_URL}
+        settings = _gate_settings(monkeypatch, configmap, extra)
+        assert settings.is_production
+        assert settings.persistence_enabled
 
     def test_production_values_reference_an_existing_secret(self) -> None:
         docs = _template(*SCENARIOS["production"])
@@ -326,6 +445,10 @@ class TestSecrets:
         refs = {e["name"]: e["valueFrom"]["secretKeyRef"] for e in container["env"]}
         assert refs["TRAFFIC_AI_API_TOKEN"]["name"] == "my-secret"
         assert refs["TRAFFIC_AI_DATABASE_URL"]["name"] == "my-secret"
+        # The UI pod takes the token from the same Secret, and only the token.
+        (ui_container,) = _containers(_named(docs, "Deployment", UI))
+        ui_refs = {e["name"]: e["valueFrom"]["secretKeyRef"] for e in ui_container["env"]}
+        assert ui_refs == {"TRAFFIC_AI_API_TOKEN": refs["TRAFFIC_AI_API_TOKEN"]}
 
     def test_existing_secret_key_names_are_configurable(self) -> None:
         docs = _template(
@@ -407,6 +530,164 @@ class TestIngress:
 
     def test_ingress_can_be_disabled(self) -> None:
         assert not _of_kind(_template("--set", "ingress.enabled=false"), "Ingress")
+
+
+class TestEdgeAuth:
+    """Edge authentication on the ingress, the Kubernetes form of compose's BasicAuth."""
+
+    NGINX_EDGE = (
+        "--set",
+        "ingress.edgeAuth.enabled=true",
+        "--set",
+        "ingress.edgeAuth.secretName=basic-auth-users",
+        "--set",
+        "ingress.tls.enabled=true",
+        "--set",
+        "ingress.tls.secretName=traffic-ai-tls",
+    )
+    TRAEFIK_EDGE = (
+        "--set",
+        "ingress.edgeAuth.enabled=true",
+        "--set",
+        "ingress.tls.enabled=true",
+        "--set",
+        "ingress.tls.secretName=traffic-ai-tls",
+        *_TRAEFIK,
+    )
+
+    def test_edge_auth_is_off_by_default(self) -> None:
+        annotations = _annotations(_ingress())
+        assert not [k for k in annotations if k.startswith(NGINX_AUTH_PREFIX)]
+        assert TRAEFIK_MIDDLEWARES_ANNOTATION not in annotations
+
+    def test_production_values_turn_on_ingress_nginx_basic_auth(self) -> None:
+        annotations = _annotations(_ingress(*_PRODUCTION))
+        assert annotations["nginx.ingress.kubernetes.io/auth-type"] == "basic"
+        assert annotations["nginx.ingress.kubernetes.io/auth-secret"] == "traffic-ai-basic-auth"
+        assert annotations["nginx.ingress.kubernetes.io/auth-realm"]
+
+    def test_production_nginx_edge_auth_keeps_the_streaming_annotations(self) -> None:
+        annotations = _annotations(_ingress(*_PRODUCTION))
+        assert annotations["nginx.ingress.kubernetes.io/proxy-read-timeout"] == "3600"
+        assert annotations["nginx.ingress.kubernetes.io/proxy-buffering"] == "off"
+        assert annotations["nginx.ingress.kubernetes.io/ssl-redirect"] == "true"
+
+    def test_nginx_auth_references_a_secret_by_name_and_renders_none(self) -> None:
+        docs = _template(*self.NGINX_EDGE)
+        (ingress,) = _of_kind(docs, "Ingress")
+        assert _annotations(ingress)["nginx.ingress.kubernetes.io/auth-secret"] == (
+            "basic-auth-users"
+        )
+        assert not _of_kind(docs, "Secret"), "htpasswd hashes are created out of band"
+
+    def test_nginx_edge_auth_adds_no_traefik_annotation(self) -> None:
+        assert TRAEFIK_MIDDLEWARES_ANNOTATION not in _annotations(_ingress(*self.NGINX_EDGE))
+
+    def test_realm_is_configurable(self) -> None:
+        ingress = _ingress(*self.NGINX_EDGE, "--set", "ingress.edgeAuth.realm=Cameras")
+        assert _annotations(ingress)["nginx.ingress.kubernetes.io/auth-realm"] == "Cameras"
+
+    def test_user_annotations_are_kept_alongside_the_auth_ones(self) -> None:
+        ingress = _ingress(
+            *self.NGINX_EDGE,
+            "--set-string",
+            "ingress.annotations.example\\.org/keep=yes",
+        )
+        annotations = _annotations(ingress)
+        assert annotations["example.org/keep"] == "yes"
+        assert annotations["nginx.ingress.kubernetes.io/auth-type"] == "basic"
+
+    def test_nginx_edge_auth_without_a_secret_name_is_refused(self) -> None:
+        result = _helm(
+            "template",
+            RELEASE,
+            str(CHART),
+            "--set",
+            "ingress.edgeAuth.enabled=true",
+            "--set",
+            "ingress.tls.enabled=true",
+            "--set",
+            "ingress.tls.secretName=traffic-ai-tls",
+        )
+        assert result.returncode != 0
+        assert "ingress.edgeAuth.secretName is required" in result.stderr
+
+    def test_edge_auth_without_tls_is_refused(self) -> None:
+        # BasicAuth over plain HTTP sends the password in clear text.
+        result = _helm(
+            "template",
+            RELEASE,
+            str(CHART),
+            "--set",
+            "ingress.edgeAuth.enabled=true",
+            "--set",
+            "ingress.edgeAuth.secretName=basic-auth-users",
+        )
+        assert result.returncode != 0
+        assert "requires ingress.tls.enabled" in result.stderr
+
+    def test_traefik_attaches_the_middlewares_in_the_given_order(self) -> None:
+        annotations = _annotations(_ingress(*self.TRAEFIK_EDGE))
+        chain = annotations[TRAEFIK_MIDDLEWARES_ANNOTATION].split(",")
+        # BasicAuth must run before the bearer is injected, as in compose.yaml.
+        assert chain == TRAEFIK_MIDDLEWARES
+        assert chain.index("traffic-ai-basicauth@kubernetescrd") < chain.index(
+            "traffic-ai-api-bearer@kubernetescrd"
+        )
+
+    def test_traefik_edge_auth_adds_no_nginx_annotations(self) -> None:
+        annotations = _annotations(_ingress(*self.TRAEFIK_EDGE))
+        assert not [k for k in annotations if k.startswith("nginx.ingress.kubernetes.io/auth-")]
+
+    def test_traefik_ingress_class_is_set(self) -> None:
+        assert _ingress(*self.TRAEFIK_EDGE)["spec"]["ingressClassName"] == "traefik"
+
+    def test_traefik_edge_auth_without_middlewares_is_refused(self) -> None:
+        # Edge auth was asked for and nothing would enforce it: fail, never render
+        # an Ingress that looks protected and is not.
+        result = _helm(
+            "template",
+            RELEASE,
+            str(CHART),
+            "--set",
+            "ingress.className=traefik",
+            "--set",
+            "ingress.edgeAuth.enabled=true",
+            "--set",
+            "ingress.tls.enabled=true",
+            "--set",
+            "ingress.tls.secretName=traffic-ai-tls",
+        )
+        assert result.returncode != 0
+        assert "ingress.traefik.middlewares is required" in result.stderr
+
+    def test_traefik_without_edge_auth_and_without_middlewares_adds_nothing(self) -> None:
+        annotations = _annotations(_ingress("--set", "ingress.className=traefik"))
+        assert TRAEFIK_MIDDLEWARES_ANNOTATION not in annotations
+
+    def test_middlewares_are_ignored_for_other_controllers(self) -> None:
+        # The annotation is Traefik's; on another controller it would be noise.
+        annotations = _annotations(_ingress(*_TRAEFIK[2:]))  # middlewares, default nginx class
+        assert TRAEFIK_MIDDLEWARES_ANNOTATION not in annotations
+
+    def test_the_chart_templates_no_crds(self) -> None:
+        # Middleware CRs are user-created: the chart must render cleanly on a
+        # cluster that has no Traefik CRDs installed.
+        docs = _template(*self.TRAEFIK_EDGE)
+        for doc in docs:
+            assert not doc["apiVersion"].startswith("traefik."), doc["kind"]
+
+    def test_the_token_never_reaches_the_ingress(self) -> None:
+        # Annotations are not secret, and ingress-nginx disables configuration
+        # snippets by default. Neither the token nor a header-injecting snippet
+        # may appear on the Ingress, however it is configured.
+        for extra in (self.NGINX_EDGE, self.TRAEFIK_EDGE):
+            ingress = _ingress(*extra, "--set", f"auth.apiToken={TOKEN_SENTINEL}")
+            assert TOKEN_SENTINEL not in yaml.safe_dump(ingress)
+            for key, value in _annotations(ingress).items():
+                assert "snippet" not in key
+                assert "Bearer" not in value
+                assert "Authorization" not in value
 
 
 class TestServices:

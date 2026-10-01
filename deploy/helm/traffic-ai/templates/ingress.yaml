@@ -1,11 +1,41 @@
 {{- if .Values.ingress.enabled }}
+{{- /*
+Annotations are the user's own, plus whatever edge authentication adds. Built
+here rather than in values so a controller-specific annotation can never be
+forgotten (or half-set) when edgeAuth.enabled is true.
+
+Everything below fails closed: asking for edge auth and not supplying what the
+controller needs to enforce it is a render error, never an Ingress that looks
+protected and is not. Credentials never appear here, only the NAME of the
+Secret (ingress-nginx) or the names of Middleware CRs (Traefik) that hold them.
+*/ -}}
+{{- $edge := .Values.ingress.edgeAuth }}
+{{- $traefik := eq (default "" .Values.ingress.className) "traefik" }}
+{{- $annotations := deepCopy (default (dict) .Values.ingress.annotations) }}
+{{- if $edge.enabled }}
+  {{- if not .Values.ingress.tls.enabled }}
+    {{- fail "ingress.edgeAuth.enabled requires ingress.tls.enabled: BasicAuth credentials would cross the network in clear text over HTTP" }}
+  {{- end }}
+  {{- if $traefik }}
+    {{- if not .Values.ingress.traefik.middlewares }}
+      {{- fail "ingress.traefik.middlewares is required when ingress.edgeAuth.enabled is true and ingress.className is traefik (create the Middleware CRs, then list them as <namespace>-<name>@kubernetescrd)" }}
+    {{- end }}
+  {{- else }}
+    {{- $_ := set $annotations "nginx.ingress.kubernetes.io/auth-type" "basic" }}
+    {{- $_ := set $annotations "nginx.ingress.kubernetes.io/auth-secret" (required "ingress.edgeAuth.secretName is required when ingress.edgeAuth.enabled is true" $edge.secretName) }}
+    {{- $_ := set $annotations "nginx.ingress.kubernetes.io/auth-realm" $edge.realm }}
+  {{- end }}
+{{- end }}
+{{- if and $traefik .Values.ingress.traefik.middlewares }}
+  {{- $_ := set $annotations "traefik.ingress.kubernetes.io/router.middlewares" (join "," .Values.ingress.traefik.middlewares) }}
+{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: {{ include "traffic-ai.fullname" . }}
   labels:
     {{- include "traffic-ai.labels" . | nindent 4 }}
-  {{- with .Values.ingress.annotations }}
+  {{- with $annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}

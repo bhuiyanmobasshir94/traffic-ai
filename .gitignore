@@ -121,6 +121,10 @@ celerybeat.pid
 
 # Environments
 .env
+# Every .env.<name> variant (.env.production, .env.local, ...) except the
+# tracked template, which carries no values for secrets.
+.env.*
+!.env.example
 .venv
 env/
 venv/
@@ -172,3 +176,7 @@ cython_debug/
 data/videos/*.mp4
 .venv/
 letsencrypt/
+
+# Traefik BasicAuth users (bcrypt hashes). Created by the operator; only the
+# comment-only .example template is tracked.
+config/traefik/users.htpasswd

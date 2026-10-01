@@ -52,6 +52,14 @@ data:
   TRAFFIC_AI_LOG_LEVEL: {{ .Values.ui.env.logLevel | quote }}
   TRAFFIC_AI_LOG_FORMAT: {{ .Values.ui.env.logFormat | quote }}
   TRAFFIC_AI_REDIS_URL: {{ .Values.redis.url | quote }}
+  # The UI process builds the same Settings, so the production gate applies to
+  # it too. It never touches the database and is given no URL, so without this
+  # it would refuse to start on the development-password default URL.
+  # compose.yaml sets the same flag on the ui service.
+  TRAFFIC_AI_PERSISTENCE_ENABLED: "false"
+  # Mirrors the worker's, so the two processes cannot disagree about whether
+  # an open API is intended. The token itself comes from the Secret.
+  TRAFFIC_AI_ALLOW_UNAUTHENTICATED: {{ .Values.auth.allowUnauthenticated | quote }}
   # Server-to-server, in-cluster: the worker Service (compose.yaml's
   # `http://worker:8000`).
   TRAFFIC_AI_API_INTERNAL_URL: {{ printf "http://%s:%v" (include "traffic-ai.worker.fullname" .) .Values.worker.service.port | quote }}

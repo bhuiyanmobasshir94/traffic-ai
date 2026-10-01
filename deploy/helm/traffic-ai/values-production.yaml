@@ -53,6 +53,23 @@ ingress:
     # Pre-created kubernetes.io/tls Secret, or one your certificate manager
     # populates. This chart does not install cert-manager or its CRDs.
     secretName: traffic-ai-tls
+  # Edge BasicAuth, the Kubernetes counterpart of compose.yaml's Traefik login.
+  # Create the Secret first (htpasswd lines under the key `auth`):
+  #
+  #   kubectl -n traffic-ai create secret generic traffic-ai-basic-auth \
+  #     --from-file=auth=<(htpasswd -nbB admin '<password>')
+  #
+  # KNOWN LIMIT with ingress-nginx, which this overlay targets: it gates the
+  # dashboard, but it cannot inject the API token toward the worker, so the
+  # browser's direct /api requests (the live MJPEG video) reach the worker with
+  # the BasicAuth header and get 401. Pick one before going live, in
+  # docs/KUBERNETES.md, "Edge authentication": run Traefik as the ingress
+  # (className: traefik + traefik.middlewares), or front /api with a forward-auth
+  # proxy that injects the header, or accept an edge-only /api
+  # (auth.allowUnauthenticated: true plus the NetworkPolicy below).
+  edgeAuth:
+    enabled: true
+    secretName: traffic-ai-basic-auth
   annotations:
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
     # Streamlit holds a WebSocket (/_stcore/stream) open and the worker serves
