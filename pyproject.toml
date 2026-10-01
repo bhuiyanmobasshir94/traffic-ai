@@ -105,6 +105,15 @@ packages = ["src/traffic_ai"]
 # --------------------------------------------------------------------------
 # uv — reproducible resolution
 # --------------------------------------------------------------------------
+[tool.uv]
+# ultralytics depends on `opencv-python` (5.x, GUI build) while this project
+# pins `opencv-python-headless` 4.x. Both wheels write the same `cv2/` package,
+# so whichever installs last wins — and with uv's parallel installs that order
+# is not guaranteed. In practice `import cv2` returned 5.0, silently breaking
+# the deliberate 4.x hold above. The headless wheel already provides every
+# `cv2` symbol ultralytics uses, so the GUI build is excluded outright.
+override-dependencies = ["opencv-python; sys_platform == 'never'"]
+
 # Pins torch and torchvision to the PyTorch CPU wheel index so the pairing
 # documented above (same index, same command) is encoded in uv.lock itself and
 # cannot silently drift to a CUDA build or a mismatched pair on a future
