@@ -1,4 +1,5 @@
-"""FastAPI application: process lifespan, route wiring, and request-id logging.
+"""FastAPI application: process lifespan, route wiring, request-id logging, and
+the edge-hardening middleware stack (metrics, security headers, rate limit, auth).
 
 This process doubles as the worker host: the lifespan starts each camera
 pipeline as a background task and the routes read the state those pipelines
@@ -11,6 +12,7 @@ so `traffic_ai.api.app` stays importable with the worker package absent.
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -20,6 +22,8 @@ import structlog
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 
+from traffic_ai import metrics
+from traffic_ai.api.middleware import AuthMiddleware, RateLimitMiddleware, SecurityHeadersMiddleware
 from traffic_ai.api.routes import router
 from traffic_ai.config import Settings, get_settings
 from traffic_ai.domain import CameraState
@@ -90,6 +94,60 @@ async def _request_id_middleware(
     return response
 
 
+# Label for a request that matched no route (a 404, or a request an outer
+# layer rejected before routing ran). A fixed string, never the raw path: see
+# `_route_label`.
+_UNMATCHED_ROUTE_LABEL = "unmatched"
+
+
+def _route_label(request: Request) -> str:
+    """The Prometheus `path` label: the matched route TEMPLATE, never the URL.
+
+    `/api/cameras/{camera_id}/frame.jpg` is one label value however many
+    camera ids are requested; the raw path would be a new value per id, and a
+    404 on an attacker-chosen path would mint one per probe. An unbounded label
+    set is the classic way to exhaust a Prometheus server's memory, so anything
+    that did not match a route collapses to one fixed label instead.
+
+    Starlette's router writes `scope["route"]` into the scope dict in place
+    when it matches, and this request shares that dict with the inner app, so
+    the value is already there by the time `call_next` returns.
+    """
+    route = request.scope.get("route")
+    path = getattr(route, "path", None)
+    return path if isinstance(path, str) else _UNMATCHED_ROUTE_LABEL
+
+
+async def _metrics_middleware(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    """Count and time every request. Only installed when metrics are enabled.
+
+    Observability must never break the request it observes, so the recording
+    is kept to a counter increment and a histogram observation, both of which
+    are in-memory and non-raising.
+    """
+    start = time.perf_counter()
+    status = "500"
+    try:
+        response = await call_next(request)
+        status = str(response.status_code)
+        return response
+    finally:
+        # An exception that escapes `call_next` is about to become a 500 in
+        # Starlette's outermost error handler, so it is counted as one.
+        path = _route_label(request)
+        metrics.http_requests_total.labels(request.method, path, status).inc()
+        metrics.http_request_duration_seconds.labels(request.method, path).observe(
+            time.perf_counter() - start
+        )
+
+
+async def _metrics_endpoint() -> Response:
+    payload, content_type = metrics.render()
+    return Response(content=payload, media_type=content_type)
+
+
 def create_app(
     *,
     settings: Settings | None = None,
@@ -150,6 +208,56 @@ def create_app(
             logger.info("api.shutdown")
 
     app = FastAPI(lifespan=lifespan)
+
+    # --- middleware stack ---------------------------------------------------
+    # Wanted nesting, OUTERMOST first:
+    #
+    #   request-id -> metrics -> security headers -> rate limit -> auth -> routes
+    #
+    # Starlette's `add_middleware` (which `app.middleware("http")` calls)
+    # inserts at the FRONT of the stack, so the LAST one registered is the
+    # OUTERMOST. The registrations below are therefore written in the reverse of
+    # the nesting above — auth first, request-id last. Reordering these calls
+    # silently reorders the stack, so each carries its reason:
+    #
+    # - request-id is outermost so every log line in the request, including the
+    #   401 and 429 that inner layers emit, carries the id; it also stamps the
+    #   id on every response, rejected ones included.
+    # - metrics sits just inside it so a request an inner layer rejects (401,
+    #   429) is still counted and timed; a metrics layer inside auth would be
+    #   blind to exactly the traffic an operator most wants to see.
+    # - security headers sit outside rate limit and auth so those layers'
+    #   error responses carry the headers too. They are not a feature of the
+    #   happy path only.
+    # - rate limit sits outside auth so an unauthenticated flood is throttled
+    #   BEFORE it reaches the token check, rather than being free to hammer it.
+    # - auth is innermost of the four: it only decides whether a request that
+    #   survived everything above may reach a route.
+    #
+    # A disabled feature is not installed at all, rather than installed and
+    # checking a flag on every request.
+    if resolved_settings.auth_enabled:
+        app.add_middleware(AuthMiddleware, settings=resolved_settings)
+    if resolved_settings.rate_limit_enabled:
+        app.add_middleware(RateLimitMiddleware, settings=resolved_settings)
+    if resolved_settings.security_headers_enabled:
+        app.add_middleware(SecurityHeadersMiddleware, settings=resolved_settings)
+    if resolved_settings.metrics_enabled:
+        app.middleware("http")(_metrics_middleware)
     app.middleware("http")(_request_id_middleware)
+
     app.include_router(router)
+
+    if resolved_settings.metrics_enabled:
+        # The routes live in `routes.py`, but the scrape path is a setting, so
+        # it is registered here. It sits under `/api` and is not in
+        # `auth_exempt_paths`, so when a token is configured `AuthMiddleware`
+        # covers it like any other route: metrics reveal camera ids and traffic
+        # volume, which are not for anonymous callers.
+        app.add_api_route(
+            resolved_settings.metrics_path,
+            _metrics_endpoint,
+            methods=["GET"],
+            include_in_schema=False,
+        )
     return app

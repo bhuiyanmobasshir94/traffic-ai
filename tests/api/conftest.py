@@ -96,6 +96,32 @@ def _pipeline_factory_with(*pipelines: CameraPipeline) -> PipelineFactory:
 
 
 @pytest.fixture
+def settings_factory() -> Callable[..., Settings]:
+    """Build `Settings` with explicit overrides, ignoring the environment.
+
+    The hardening tests flip auth, rate limiting, and the environment on and
+    off, so each pins the fields it depends on rather than inheriting whatever
+    the developer's shell exports. `api_token` and `environment` are pinned to
+    their off/development values here for the same reason: an exported
+    `TRAFFIC_AI_API_TOKEN` must not turn the unauthenticated tests into 401s.
+    """
+
+    def build(**overrides: object) -> Settings:
+        values: dict[str, object] = {
+            "redis_url": "redis://localhost:6379/15",
+            "state_ttl_seconds": 30,
+            "event_history": 50,
+            "anpr_enabled": False,
+            "api_token": None,
+            "environment": "development",
+        }
+        values.update(overrides)
+        return Settings(_env_file=None, **values)  # type: ignore[call-arg]
+
+    return build
+
+
+@pytest.fixture
 def make_pipeline() -> Callable[..., StubPipeline]:
     return StubPipeline
 
