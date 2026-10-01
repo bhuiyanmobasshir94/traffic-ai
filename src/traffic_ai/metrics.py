@@ -108,6 +108,27 @@ crossings_total = Counter(
 )
 
 
+# --- history persistence ----------------------------------------------------
+# Crossings counted live but never written to Postgres. History is deliberately
+# best-effort (a database outage must not take the dashboard down), which makes the
+# loss itself the thing worth alerting on: without this, history totals are quietly
+# short and nothing says so. `increase(history_events_lost_total[...]) > 0` is the
+# alert; the readiness endpoint and the Analytics page surface the same number.
+HISTORY_LOSS_BUFFER_FULL = "buffer_full"  # evicted from the in-memory buffer during an outage
+HISTORY_LOSS_FLUSH_FAILED = "flush_failed"  # a batch the database refused, after the split retry
+
+history_events_lost_total = Counter(
+    "history_events_lost_total",
+    "Crossing events counted live but not persisted to history, by reason.",
+    ["reason"],
+    registry=registry,
+)
+# Created up front so both series exist at 0 from the first scrape: `increase()` over a
+# series that appears only after the first loss misses that first loss.
+for _reason in (HISTORY_LOSS_BUFFER_FULL, HISTORY_LOSS_FLUSH_FAILED):
+    history_events_lost_total.labels(_reason)
+
+
 def render() -> tuple[bytes, str]:
     """Render the current state of `registry` in Prometheus text exposition
     format, paired with the content type that must accompany it."""

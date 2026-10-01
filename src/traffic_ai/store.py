@@ -7,6 +7,7 @@ tell the difference between "no data" and "stale data" and says so.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 
 import redis.asyncio as aioredis
@@ -14,6 +15,9 @@ import redis.asyncio as aioredis
 from traffic_ai.domain import CameraState, CrossingEvent
 
 _NAMESPACE = "traffic-ai"
+
+# Matches the database probe's bound in `api/routes.py`.
+_PING_TIMEOUT_SECONDS = 2.0
 
 
 def _state_key(camera_id: str) -> str:
@@ -54,12 +58,18 @@ class StateStore:
         return cls(client, ttl_seconds=ttl_seconds, event_history=event_history)
 
     async def ping(self) -> bool:
-        """Liveness probe for the readiness endpoint. Never raises."""
+        """Liveness probe for the readiness endpoint. Never raises, never hangs.
+
+        Bounded by `_PING_TIMEOUT_SECONDS`: a Redis host that black-holes packets
+        would otherwise hold this call until the socket gives up, which can outlast the
+        orchestrator's own probe timeout and fail the probe for the wrong reason.
+        """
         try:
-            return bool(await self._redis.ping())
+            return bool(await asyncio.wait_for(self._redis.ping(), timeout=_PING_TIMEOUT_SECONDS))
         except Exception:
             # A probe reports False; it does not crash the caller. This is the one
             # place a broad catch is correct — readiness must survive Redis being down.
+            # A timeout lands here too: `TimeoutError` is an `Exception`.
             return False
 
     # --- state ------------------------------------------------------------

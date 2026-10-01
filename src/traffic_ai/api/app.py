@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -27,6 +28,7 @@ from traffic_ai import metrics
 from traffic_ai.api.middleware import AuthMiddleware, RateLimitMiddleware, SecurityHeadersMiddleware
 from traffic_ai.api.routes import router
 from traffic_ai.config import Settings, get_settings
+from traffic_ai.db.errors import describe_db_error
 from traffic_ai.db.session import Database
 from traffic_ai.db.sink import RepositoryHistory, RepositorySink
 from traffic_ai.db.writer import CrossingWriter
@@ -124,12 +126,23 @@ async def _run_writer(writer: CrossingWriter) -> None:
         logger.exception("db.writer_crashed")
 
 
+# An inbound request id is attacker-controlled text that is written into every log line of
+# the request and echoed into a response header. Accept only what a trace id looks like:
+# short, and nothing that could forge a log line or split a header. `fullmatch`, not
+# `match` with `$`, because `$` also matches before a trailing newline.
+_REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,128}")
+
+
 async def _request_id_middleware(
     request: Request, call_next: Callable[[Request], Awaitable[Response]]
 ) -> Response:
     """Bind a per-request id into structlog contextvars and echo it back.
-    Accepts an inbound `X-Request-ID` so a caller's trace id survives."""
-    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    Accepts an inbound `X-Request-ID` so a caller's trace id survives -- when it is
+    well-formed (see `_REQUEST_ID_PATTERN`); otherwise a fresh id is generated."""
+    inbound = request.headers.get("X-Request-ID")
+    request_id = (
+        inbound if inbound and _REQUEST_ID_PATTERN.fullmatch(inbound) else str(uuid.uuid4())
+    )
     structlog.contextvars.bind_contextvars(request_id=request_id)
     try:
         response = await call_next(request)
@@ -252,13 +265,20 @@ def create_app(
                 )
             except Exception as exc:
                 # Bad URL, missing driver, invalid pool settings. Live-only from here on.
-                logger.error("db.init_failed", error=str(exc))
+                # Not `str(exc)`: an unparseable URL is quoted by the error, password and all.
+                logger.error("db.init_failed", **describe_db_error(exc))
                 if owns_database and history_db is not None:
                     await history_db.close()
                 history_db, history_writer, owns_database = None, None, False
         if history_writer is not None:
             # Started before the pipelines so the first crossing already has a consumer.
             writer_task = asyncio.create_task(_run_writer(history_writer))
+
+        # Set at the very start of teardown. An MJPEG stream on a healthy pipeline never
+        # ends by itself, so each open one is a request the server cannot finish; see
+        # `routes._mjpeg_frames`. Created before the `try` so teardown always has it.
+        shutdown_event = asyncio.Event()
+        app.state.shutdown_event = shutdown_event
 
         pipelines: list[CameraPipeline] = []
         tasks: list[asyncio.Task[None]] = []
@@ -273,6 +293,7 @@ def create_app(
             app.state.pipelines = pipelines
             app.state.pipeline_tasks = tasks
             app.state.database = history_db
+            app.state.history_writer = history_writer
             app.state.history = RepositoryHistory(history_db) if history_db is not None else None
 
             logger.info(
@@ -282,6 +303,7 @@ def create_app(
             )
             yield
         finally:
+            shutdown_event.set()
             # Order matters: pipelines first, so nothing is still calling `submit()` when
             # the writer drains. Reversed, the final crossings land in a buffer nobody
             # flushes.
@@ -336,7 +358,10 @@ def create_app(
     #   error responses carry the headers too. They are not a feature of the
     #   happy path only.
     # - rate limit sits outside auth so an unauthenticated flood is throttled
-    #   BEFORE it reaches the token check, rather than being free to hammer it.
+    #   BEFORE it reaches the token check, rather than being free to hammer it. It
+    #   recognises a valid bearer token itself (to exempt the trusted UI, and the
+    #   probe paths, from throttling) instead of moving inside auth: reordering would
+    #   let a flood of bad tokens past the limiter and into the 401 path for free.
     # - auth is innermost of the four: it only decides whether a request that
     #   survived everything above may reach a route.
     #

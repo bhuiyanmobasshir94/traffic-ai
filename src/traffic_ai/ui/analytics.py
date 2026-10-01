@@ -37,7 +37,7 @@ from traffic_ai.ui.client import (
     WorkerUnavailable,
     get_worker_client,
 )
-from traffic_ai.ui.components import build_event_rows, render_sidebar
+from traffic_ai.ui.components import build_event_rows, render_demo_footage_notice, render_sidebar
 
 ALL_CAMERAS = "All cameras"
 
@@ -72,6 +72,9 @@ class HistoryView:
     counts: HistoryCounts | None = None
     hourly: HistoryHourly | None = None
     events: tuple[CrossingEvent, ...] = ()
+    # Crossings the worker counted live but failed to persist, when it reported any.
+    # `None` is "unknown or none reported"; the page warns only on a positive number.
+    events_lost: int | None = None
 
 
 # --- pure helpers (no Streamlit; unit-tested directly) -------------------------
@@ -167,7 +170,15 @@ def fetch_history(
 
     windowed = tuple(event for event in events if _as_utc(event.crossed_at) >= since)
     status = HistoryStatus.OK if counts.total > 0 or windowed else HistoryStatus.EMPTY
-    return HistoryView(status, counts=counts, hourly=hourly, events=windowed)
+    # Asked only once there are totals on screen to qualify. Best effort by design: a
+    # worker that cannot say how much it lost must not blank a page that loaded fine.
+    return HistoryView(
+        status,
+        counts=counts,
+        hourly=hourly,
+        events=windowed,
+        events_lost=client.history_events_lost(),
+    )
 
 
 # --- rendering -----------------------------------------------------------------
@@ -185,6 +196,11 @@ def render_history(view: HistoryView) -> None:
     if view.status is HistoryStatus.ERROR:
         st.error(f"Could not load history. {view.message}")
         return
+    if view.events_lost:
+        st.warning(
+            f"{view.events_lost} crossing(s) counted by the worker could not be saved to "
+            "history since it started, so the totals on this page may be incomplete."
+        )
     if view.status is HistoryStatus.EMPTY or view.counts is None or view.hourly is None:
         st.info("No crossings recorded in this window.")
         return
@@ -228,6 +244,7 @@ def render_analytics(*, page_key: str, title: str) -> None:
 
     render_sidebar()
     st.title(title)
+    render_demo_footage_notice()
 
     camera_col, window_col = st.columns(2)
     camera_choice = camera_col.selectbox(

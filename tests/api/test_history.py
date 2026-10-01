@@ -13,16 +13,21 @@ render as "no traffic".
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+import structlog
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from traffic_ai.api import app as app_module
 from traffic_ai.api import routes as routes_module
 from traffic_ai.api.dependencies import MAX_HISTORY_WINDOW, get_history_reader
 from traffic_ai.cameras import CAMERAS
+from traffic_ai.db.models import Base
+from traffic_ai.db.session import Database
 from traffic_ai.db.writer import CrossingWriter
 from traffic_ai.domain import CameraState, CrossingEvent, Direction, PipelineStatus
 
@@ -605,6 +610,187 @@ async def test_readyz_is_still_503_for_non_database_reasons_and_reports_the_data
     assert resp.status_code == 503
     assert resp.json()["database"] is True
     assert resp.json()["detail"] == "no camera pipeline running"
+
+
+# --- readiness: a reachable database with no schema is not a healthy one ----------------
+
+
+@pytest.fixture
+async def sqlite_engine(tmp_path) -> AsyncIterator[AsyncEngine]:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'history.db'}")
+    yield engine
+    await engine.dispose()
+
+
+async def test_readyz_database_is_false_for_a_reachable_database_with_no_schema(
+    app_factory, running_app, make_pipeline, sqlite_engine
+) -> None:
+    """Connectivity alone used to be enough: an unmigrated Postgres answered the ping, readiness
+    said the database was fine, and every history write and query failed on the missing table."""
+    app = app_factory(pipelines=[make_pipeline("toll-plaza-a")], database=Database(sqlite_engine))
+    async with running_app(app) as client:
+        resp = await client.get("/api/readyz")
+    assert resp.json()["database"] is False
+    assert resp.status_code == 200  # still reported, never gating
+
+
+async def test_readyz_database_is_true_once_the_schema_exists(
+    app_factory, running_app, make_pipeline, sqlite_engine
+) -> None:
+    async with sqlite_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    app = app_factory(pipelines=[make_pipeline("toll-plaza-a")], database=Database(sqlite_engine))
+    async with running_app(app) as client:
+        resp = await client.get("/api/readyz")
+    assert resp.json()["database"] is True
+
+
+# --- readiness: history events lost ---------------------------------------------------
+
+
+def _lossy_writer(*, submitted: int, buffer_limit: int) -> CrossingWriter:
+    """A writer that never flushes, so only buffer evictions can lose events."""
+    writer = CrossingWriter(
+        _RecordingSink([]),
+        flush_interval_seconds=60.0,
+        flush_max_batch=100,
+        buffer_limit=buffer_limit,
+    )
+    for n in range(submitted):
+        writer.submit(_event(n))
+    return writer
+
+
+async def test_readyz_reports_how_many_history_events_were_lost(
+    app_factory, running_app, make_pipeline
+) -> None:
+    writer = _lossy_writer(submitted=5, buffer_limit=2)  # 3 evicted
+    app = app_factory(
+        pipelines=[make_pipeline("toll-plaza-a")], database=_FakeDatabase(), writer=writer
+    )
+    async with running_app(app) as client:
+        resp = await client.get("/api/readyz")
+    assert resp.status_code == 200  # reported, never gating
+    assert resp.json()["history_events_lost"] == 3
+
+
+async def test_readyz_reports_zero_when_nothing_was_lost(
+    app_factory, running_app, make_pipeline
+) -> None:
+    writer = _lossy_writer(submitted=2, buffer_limit=10)
+    app = app_factory(
+        pipelines=[make_pipeline("toll-plaza-a")], database=_FakeDatabase(), writer=writer
+    )
+    async with running_app(app) as client:
+        resp = await client.get("/api/readyz")
+    assert resp.json()["history_events_lost"] == 0
+
+
+async def test_readyz_history_events_lost_is_null_when_persistence_is_disabled(
+    app_factory, running_app, make_pipeline
+) -> None:
+    """Null is "there is no writer to ask", not "zero lost"."""
+    app = app_factory(pipelines=[make_pipeline("toll-plaza-a")])
+    async with running_app(app) as client:
+        resp = await client.get("/api/readyz")
+    assert resp.json()["history_events_lost"] is None
+
+
+async def test_readyz_history_events_lost_is_null_when_the_database_failed_to_initialise(
+    app_factory, running_app, make_pipeline, monkeypatch
+) -> None:
+    def boom(settings):
+        raise RuntimeError("bad url")
+
+    monkeypatch.setattr(app_module.Database, "from_settings", boom)
+    app = app_factory(pipelines=[make_pipeline("toll-plaza-a")], persistence=True)
+    async with running_app(app) as client:
+        resp = await client.get("/api/readyz")
+    assert resp.json()["history_events_lost"] is None
+
+
+# --- database errors never put row data in a log line ---------------------------------
+
+
+class _DriverError(Exception):
+    pass
+
+
+def _row_bearing_error() -> DBAPIError:
+    return DBAPIError(
+        "INSERT INTO crossing_events (plate_text) VALUES (%s)",
+        ("SECRET-PLATE-0042",),
+        _DriverError("DETAIL: Key (plate_text)=(SECRET-PLATE-0042) already exists."),
+    )
+
+
+@pytest.mark.parametrize("path", ENDPOINTS)
+async def test_a_failed_history_query_logs_the_error_type_not_the_row_data(
+    history_app, running_app, monkeypatch, path: str
+) -> None:
+    app = history_app(_FakeHistory(error=_row_bearing_error()))
+    async with running_app(app) as client:
+        with structlog.testing.capture_logs() as logs:
+            # A fresh logger: `configure_logging` (run by the lifespan) caches the module's.
+            monkeypatch.setattr(routes_module, "logger", structlog.get_logger("traffic_ai.api"))
+            resp = await client.get(path)
+
+    assert resp.status_code == 503
+    (failed,) = [entry for entry in logs if entry["event"] == "history.query_failed"]
+    assert failed["error_type"] == "DBAPIError"
+    assert failed["error"] == "_DriverError"
+    assert "SECRET-PLATE-0042" not in repr(logs)
+    assert "SECRET-PLATE-0042" not in resp.text
+
+
+async def test_a_database_init_failure_does_not_log_the_connection_url_credentials(
+    app_factory, running_app, monkeypatch
+) -> None:
+    """SQLAlchemy quotes an unparseable URL, password and all, in the exception it raises."""
+
+    def boom(settings):
+        raise ValueError("Could not parse 'postgresql+asyncpg://traffic:hunter2@db:5432/x'")
+
+    monkeypatch.setattr(app_module.Database, "from_settings", boom)
+    monkeypatch.setattr(app_module, "configure_logging", lambda **_: None)
+    with structlog.testing.capture_logs() as logs:
+        monkeypatch.setattr(app_module, "logger", structlog.get_logger("traffic_ai.api.app"))
+        app = app_factory(persistence=True)
+        async with running_app(app):
+            pass
+
+    (failed,) = [entry for entry in logs if entry["event"] == "db.init_failed"]
+    assert failed["error_type"] == "ValueError"
+    assert "hunter2" not in repr(logs)
+    assert "postgresql+asyncpg://" in failed["error"]  # still diagnosable
+
+
+# --- L1: a window that cannot be represented in UTC is a 422, not a 500 ---------------
+
+
+@pytest.mark.parametrize("path", ["/api/history/counts", "/api/history/hourly"])
+@pytest.mark.parametrize(
+    "params",
+    [
+        # Year 10000 once converted to UTC.
+        {"until": "9999-12-31T23:59:59-05:00"},
+        {"since": "9999-12-31T23:59:59-05:00"},
+        # Year 0 once converted to UTC.
+        {"since": "0001-01-01T00:00:00+05:00", "until": "2026-01-01T00:00:00Z"},
+        # Fine on its own, but the default 24h window back from it leaves the range.
+        {"until": "0001-01-01T00:00:00Z"},
+    ],
+)
+async def test_an_unrepresentable_window_is_422_and_never_reaches_the_database(
+    history_app, running_app, path: str, params: dict[str, str]
+) -> None:
+    fake = _FakeHistory()
+    app = history_app(fake)
+    async with running_app(app) as client:
+        resp = await client.get(path, params=params)
+    assert resp.status_code == 422
+    assert "UTC" in resp.json()["detail"]
+    assert fake.calls == []
 
 
 # --- lifespan: wiring and shutdown order -------------------------------------

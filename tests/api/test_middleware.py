@@ -9,6 +9,7 @@ import pytest
 from fastapi import FastAPI
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from traffic_ai.api import middleware as middleware_module
 from traffic_ai.api.middleware import AuthMiddleware, RateLimitMiddleware, SecurityHeadersMiddleware
 from traffic_ai.config import Settings
 
@@ -120,15 +121,132 @@ async def test_429_after_the_limit_with_retry_after(
     assert limited.json() == {"detail": "rate limit exceeded"}
 
 
-async def test_limit_applies_to_health_probes_too(
+async def test_health_probes_are_never_rate_limited(
+    app_factory, running_app, settings_factory, make_pipeline
+) -> None:
+    """REVERSED from `test_limit_applies_to_health_probes_too`, which pinned the opposite:
+    that an auth-exempt probe was throttled "which is what you want from a flood of
+    probes". It is not. An orchestrator that gets a 429 from its liveness or readiness
+    probe restarts a healthy container or pulls it from rotation, so a busy client on the
+    same address (the UI, which shares one) could take the service down. The probes are
+    cheap and carry no data; the paths in `auth_exempt_paths` are exempt from the
+    limiter as well as from auth, and do not spend the budget other requests draw on."""
+    app = app_factory(
+        pipelines=[make_pipeline("toll-plaza-a")],
+        settings_override=settings_factory(rate_limit_requests=2),
+    )
+    async with running_app(app) as client:
+        health = [(await client.get("/api/healthz")).status_code for _ in range(6)]
+        ready = [(await client.get("/api/readyz")).status_code for _ in range(6)]
+        # Not one of those probes was counted: the whole budget is still there.
+        ordinary = [(await client.get("/api/cameras")).status_code for _ in range(3)]
+    assert health == [200] * 6
+    assert ready == [200] * 6
+    assert ordinary == [200, 200, 429]
+
+
+# --- the trusted UI is not throttled ---------------------------------------------
+
+
+async def test_a_valid_bearer_token_is_exempt_from_the_ordinary_limit(
     app_factory, running_app, settings_factory
 ) -> None:
-    """Rate limiting is keyed on the client, not the path: an exempt-from-auth
-    probe is still throttled, which is what you want from a flood of probes."""
-    app = app_factory(settings_override=settings_factory(rate_limit_requests=2))
+    app = app_factory(settings_override=settings_factory(api_token=TOKEN, rate_limit_requests=2))
     async with running_app(app) as client:
-        codes = [(await client.get("/api/healthz")).status_code for _ in range(3)]
-    assert codes == [200, 200, 429]
+        authed = [
+            (
+                await client.get("/api/cameras", headers={"Authorization": f"Bearer {TOKEN}"})
+            ).status_code
+            for _ in range(8)
+        ]
+    assert authed == [200] * 8
+
+
+async def test_three_viewers_polling_through_the_ui_are_not_throttled(
+    app_factory, running_app, settings_factory
+) -> None:
+    """The reported failure: the UI calls the worker server-to-server, ~90 requests a
+    minute per open viewer, all from the one UI container address -- one bucket. Two
+    viewers already exceed the 120/min default, and the UI then reported a healthy worker
+    as unavailable. Three viewers for a full minute, bearer token on every request."""
+    app = app_factory(settings_override=settings_factory(api_token=TOKEN))  # default limits
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    async with running_app(app) as client:
+        codes = [
+            (await client.get("/api/cameras", headers=headers)).status_code for _ in range(270)
+        ]
+    assert 429 not in codes
+    assert codes == [200] * 270
+
+
+async def test_the_same_traffic_without_a_valid_token_is_throttled(
+    app_factory, running_app, settings_factory
+) -> None:
+    """Control for the test above: it only means something if this volume WOULD be
+    limited, and a request with a missing or wrong token still is -- the exemption is
+    the credential, not the address."""
+    app = app_factory(settings_override=settings_factory(api_token=TOKEN))
+    async with running_app(app) as client:
+        anonymous = [(await client.get("/api/cameras")).status_code for _ in range(270)]
+        wrong = [
+            (
+                await client.get("/api/cameras", headers={"Authorization": "Bearer not-the-token"})
+            ).status_code
+            for _ in range(3)
+        ]
+    assert anonymous[:120] == [401] * 120
+    assert set(anonymous[120:]) == {429}
+    # Same address, same bucket, already spent -- a wrong token does not buy a way out.
+    assert wrong == [429, 429, 429]
+
+
+@pytest.mark.parametrize(
+    "authorization", ["Bearer ", "Bearer", "Basic dXNlcjpwYXNz", "bearer-but-not", ""]
+)
+async def test_a_malformed_or_foreign_credential_gets_no_exemption(
+    app_factory, running_app, settings_factory, authorization: str
+) -> None:
+    app = app_factory(settings_override=settings_factory(api_token=TOKEN, rate_limit_requests=1))
+    async with running_app(app) as client:
+        codes = [
+            (await client.get("/api/cameras", headers={"Authorization": authorization})).status_code
+            for _ in range(2)
+        ]
+    assert codes == [401, 429]
+
+
+async def test_the_token_does_not_exempt_the_stream_budget(
+    app_factory, running_app, settings_factory
+) -> None:
+    """A browser's stream request can carry the token (the edge injects it). Holding many
+    long-lived streams is exactly what the stream budget is for, so it still applies."""
+    app = app_factory(
+        settings_override=settings_factory(
+            api_token=TOKEN, rate_limit_requests=100, rate_limit_stream_requests=2
+        )
+    )
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    async with running_app(app) as client:
+        streams = [
+            (await client.get("/api/cameras/nope/stream.mjpg", headers=headers)).status_code
+            for _ in range(3)
+        ]
+    assert streams == [404, 404, 429]
+
+
+async def test_without_a_configured_token_nothing_is_exempt_by_credential(
+    app_factory, running_app, settings_factory
+) -> None:
+    """No token configured: a caller cannot present a "valid" one, whatever it sends."""
+    app = app_factory(settings_override=settings_factory(rate_limit_requests=1))
+    async with running_app(app) as client:
+        codes = [
+            (
+                await client.get("/api/cameras", headers={"Authorization": "Bearer anything"})
+            ).status_code
+            for _ in range(2)
+        ]
+    assert codes == [200, 429]
 
 
 async def test_clients_are_limited_independently(
@@ -142,23 +260,134 @@ async def test_clients_are_limited_independently(
     assert (a1.status_code, a2.status_code, b1.status_code) == (200, 429, 200)
 
 
-async def test_forwarded_for_uses_the_leftmost_entry(
+async def test_forwarded_for_uses_the_entry_the_trusted_proxy_appended(
     app_factory, running_app, settings_factory
 ) -> None:
-    """Leftmost is the original client; later entries are proxies that appended
-    themselves. Two requests sharing the first hop share a bucket."""
+    """REPLACES `test_forwarded_for_uses_the_leftmost_entry`. The leftmost entry is
+    whatever the caller wrote, so keying on it lets anyone mint a fresh bucket per request.
+    With the default one trusted proxy the client is the RIGHTMOST entry -- the address
+    that proxy saw -- and everything to its left is ignored."""
     app = app_factory(settings_override=settings_factory(rate_limit_requests=1))
     async with running_app(app) as client:
         first = await client.get(
-            "/api/cameras", headers={"X-Forwarded-For": "198.51.100.7, 10.0.0.1"}
+            "/api/cameras", headers={"X-Forwarded-For": "203.0.113.9, 198.51.100.7"}
         )
-        same_client = await client.get(
-            "/api/cameras", headers={"X-Forwarded-For": "198.51.100.7, 10.0.0.99"}
+        # A different (spoofed) leftmost entry, same address behind the proxy: same client.
+        spoofed_left = await client.get(
+            "/api/cameras", headers={"X-Forwarded-For": "203.0.113.77, 198.51.100.7"}
         )
         other_client = await client.get(
-            "/api/cameras", headers={"X-Forwarded-For": "198.51.100.8, 10.0.0.1"}
+            "/api/cameras", headers={"X-Forwarded-For": "203.0.113.9, 198.51.100.8"}
         )
-    assert (first.status_code, same_client.status_code, other_client.status_code) == (200, 429, 200)
+    assert (first.status_code, spoofed_left.status_code, other_client.status_code) == (
+        200,
+        429,
+        200,
+    )
+
+
+async def test_trusted_proxy_hops_counts_from_the_right(
+    app_factory, running_app, settings_factory
+) -> None:
+    """Two proxies in front: the client is the second entry from the right."""
+    app = app_factory(
+        settings_override=settings_factory(rate_limit_requests=1, trusted_proxy_hops=2)
+    )
+    async with running_app(app) as client:
+        first = await client.get(
+            "/api/cameras", headers={"X-Forwarded-For": "192.0.2.1, 198.51.100.7, 10.0.0.2"}
+        )
+        same = await client.get(
+            "/api/cameras", headers={"X-Forwarded-For": "192.0.2.99, 198.51.100.7, 10.0.0.3"}
+        )
+        other = await client.get(
+            "/api/cameras", headers={"X-Forwarded-For": "192.0.2.1, 198.51.100.8, 10.0.0.2"}
+        )
+    assert (first.status_code, same.status_code, other.status_code) == (200, 429, 200)
+
+
+async def test_zero_trusted_hops_ignores_forwarded_for_entirely(
+    app_factory, running_app, settings_factory
+) -> None:
+    """A worker reachable with no proxy in front: the header is pure spoofing, so every
+    request is keyed on the socket peer however it varies the header."""
+    app = app_factory(
+        settings_override=settings_factory(rate_limit_requests=2, trusted_proxy_hops=0)
+    )
+    async with running_app(app) as client:
+        codes = [
+            (
+                await client.get("/api/cameras", headers={"X-Forwarded-For": f"203.0.113.{n}"})
+            ).status_code
+            for n in range(1, 4)
+        ]
+    assert codes == [200, 200, 429]
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "not-an-ip",  # the rightmost entry is not an address
+        "203.0.113.1, not-an-ip",
+        "198.51.100.7:8080",  # a port makes it not an address
+        "203.0.113.1, ",  # blank rightmost entry
+        "999.1.1.1",
+        "<script>alert(1)</script>",
+    ],
+)
+async def test_an_invalid_forwarded_for_entry_falls_back_to_the_peer(
+    app_factory, running_app, settings_factory, header: str
+) -> None:
+    """An entry that is not an IP is never used as a key: it falls back to the socket peer,
+    so these all share the one peer bucket along with a request that sent no header."""
+    app = app_factory(settings_override=settings_factory(rate_limit_requests=1))
+    async with running_app(app) as client:
+        invalid = await client.get("/api/cameras", headers={"X-Forwarded-For": header})
+        no_header = await client.get("/api/cameras")
+    assert (invalid.status_code, no_header.status_code) == (200, 429)
+
+
+async def test_fewer_entries_than_trusted_hops_falls_back_to_the_peer(
+    app_factory, running_app, settings_factory
+) -> None:
+    """Two proxies are trusted but the header has one entry: the request did not come
+    through the chain we expect, so the header is not believed."""
+    app = app_factory(
+        settings_override=settings_factory(rate_limit_requests=1, trusted_proxy_hops=2)
+    )
+    async with running_app(app) as client:
+        short = await client.get("/api/cameras", headers={"X-Forwarded-For": "203.0.113.5"})
+        no_header = await client.get("/api/cameras")
+    assert (short.status_code, no_header.status_code) == (200, 429)
+
+
+async def test_ipv6_spellings_of_one_address_share_a_bucket(
+    app_factory, running_app, settings_factory
+) -> None:
+    app = app_factory(settings_override=settings_factory(rate_limit_requests=1))
+    async with running_app(app) as client:
+        compact = await client.get("/api/cameras", headers={"X-Forwarded-For": "2001:db8::1"})
+        expanded = await client.get(
+            "/api/cameras", headers={"X-Forwarded-For": "2001:0db8:0:0:0:0:0:1"}
+        )
+    assert (compact.status_code, expanded.status_code) == (200, 429)
+
+
+async def test_header_spraying_cannot_grow_the_bucket_table_without_bound(
+    app_factory, running_app, settings_factory, monkeypatch
+) -> None:
+    """Each distinct key is a bucket. With the cap, a caller choosing its own keys (a mis-set
+    `trusted_proxy_hops`) holds at most `_MAX_BUCKETS` of them; the oldest windows go first."""
+    monkeypatch.setattr(middleware_module, "_MAX_BUCKETS", 5)
+    app = app_factory(settings_override=settings_factory(rate_limit_requests=100))
+    async with running_app(app) as client:
+        for n in range(1, 41):
+            await client.get("/api/cameras", headers={"X-Forwarded-For": f"203.0.113.{n}"})
+
+    limiter = next(m for m in _walk_stack(app) if isinstance(m, RateLimitMiddleware))
+    assert len(limiter._buckets) == 5
+    # The survivors are the most recent keys; the oldest were evicted first.
+    assert {key[0] for key in limiter._buckets} == {f"203.0.113.{n}" for n in range(36, 41)}
 
 
 async def test_without_forwarded_for_the_socket_peer_is_the_client(
@@ -177,9 +406,11 @@ async def test_without_forwarded_for_the_socket_peer_is_the_client(
 async def test_blank_forwarded_for_falls_back_to_the_peer(
     app_factory, running_app, settings_factory
 ) -> None:
+    # The blank entry is now the RIGHTMOST one (`"10.0.0.1, "`), the one that is read; the
+    # old fixture `" , 10.0.0.1"` put it on the left, which is no longer consulted.
     app = app_factory(settings_override=settings_factory(rate_limit_requests=1))
     async with running_app(app) as client:
-        first = await client.get("/api/cameras", headers={"X-Forwarded-For": " , 10.0.0.1"})
+        first = await client.get("/api/cameras", headers={"X-Forwarded-For": "10.0.0.1, "})
         second = await client.get("/api/cameras")
     # Both fell back to the same peer address, so they share one bucket.
     assert (first.status_code, second.status_code) == (200, 429)

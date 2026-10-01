@@ -9,3 +9,4 @@
 - [AppTest + httpx token traps](streamlit-apptest-and-httpx-token-traps.md) — charts are `vega_lite_chart`; h11 error quotes a bad token header; page-test monkeypatch recipe.
 - [History routes + persistence wiring](history-routes-and-persistence-wiring.md) — dep-vs-422 ordering, shutdown order, app_factory persistence default, mutation-check recipe.
 - [Deployment edge-auth facts](deployment-edge-auth-facts.md) — UI runs the prod gate too, per-router Traefik middlewares, nginx can't inject bearer, compose/helm render quirks.
+- [Review-fix traps](review-fixes-traps.md) — limiter double-compares tokens, schema-aware ping via sqlite, wait_for hides cancel-swallowing streams, mutation-script hygiene.

@@ -28,6 +28,7 @@ from traffic_ai.api.dependencies import (
 )
 from traffic_ai.cameras import CAMERAS, CameraConfig
 from traffic_ai.config import Settings
+from traffic_ai.db.errors import describe_db_error
 from traffic_ai.domain import (
     CameraState,
     CameraSummary,
@@ -78,7 +79,8 @@ async def healthz(settings: SettingsDep) -> HealthResponse:
 
 
 async def _probe_database(request: Request, settings: Settings) -> bool | None:
-    """`None` when persistence is off, otherwise whether Postgres answered a ping.
+    """`None` when persistence is off, otherwise whether the database is usable: it
+    answered AND has the `crossing_events` table (see `Database.ping`).
 
     Never raises and never blocks past `_DATABASE_PROBE_TIMEOUT_SECONDS`.
     """
@@ -105,9 +107,11 @@ async def readyz(request: Request, store: StoreDep, settings: SettingsDep) -> JS
     treating any of them as ready would keep traffic arriving at an instance
     that cannot answer it.
 
-    The database is reported (`database`) but never gates readiness: the live
+    The database is reported (`database`, which is False for a reachable server
+    whose schema has not been migrated) but never gates readiness: the live
     path does not depend on it, so an instance with Postgres down still serves
     counts, frames and the stream, and should keep receiving traffic for them.
+    `history_events_lost` is reported on the same terms.
     """
     redis_ok = await store.ping()
     pipelines = getattr(request.app.state, "pipelines", [])
@@ -121,6 +125,7 @@ async def readyz(request: Request, store: StoreDep, settings: SettingsDep) -> JS
     elif cameras_running == 0:
         detail = "no camera pipeline running"
 
+    writer = getattr(request.app.state, "history_writer", None)
     body = ReadinessResponse(
         ready=ready,
         redis=redis_ok,
@@ -128,6 +133,7 @@ async def readyz(request: Request, store: StoreDep, settings: SettingsDep) -> JS
         cameras_total=cameras_total,
         detail=detail,
         database=await _probe_database(request, settings),
+        history_events_lost=writer.lost_count if writer is not None else None,
     )
     return JSONResponse(status_code=200 if ready else 503, content=body.model_dump())
 
@@ -164,19 +170,29 @@ async def camera_frame(camera: CameraDep, store: StoreDep) -> Response:
 
 
 async def _mjpeg_frames(
-    store: StateStore, camera_id: str, *, fps: float, ttl_seconds: float
+    store: StateStore,
+    camera_id: str,
+    *,
+    fps: float,
+    ttl_seconds: float,
+    stop: asyncio.Event | None = None,
 ) -> AsyncIterator[bytes]:
     """Poll the store for new frames and yield multipart/x-mixed-replace parts.
 
     Skips re-sending an unchanged frame so a stalled pipeline does not
     saturate the connection, and ends the stream if no *new* frame has shown
     up within `ttl_seconds` rather than holding the connection open forever.
+
+    `stop` is the app's shutdown event. A viewer on a healthy pipeline never
+    hits the stall exit, so without it an open stream would keep the server from
+    finishing a graceful shutdown for as long as the viewer keeps the tab open.
+    Checked once per loop, so the stream ends within one frame interval of it.
     """
     interval = 1.0 / fps
     last_frame: bytes | None = None
     last_new_frame_at = time.monotonic()
     try:
-        while True:
+        while stop is None or not stop.is_set():
             frame = await store.read_frame(camera_id)
             now = time.monotonic()
             if frame is not None and frame != last_frame:
@@ -198,13 +214,14 @@ async def _mjpeg_frames(
 
 @router.get("/cameras/{camera_id}/stream.mjpg")
 async def camera_stream(
-    camera: CameraDep, store: StoreDep, settings: SettingsDep
+    request: Request, camera: CameraDep, store: StoreDep, settings: SettingsDep
 ) -> StreamingResponse:
     frames = _mjpeg_frames(
         store,
         camera.camera_id,
         fps=settings.target_fps,
         ttl_seconds=settings.state_ttl_seconds,
+        stop=getattr(request.app.state, "shutdown_event", None),
     )
     return StreamingResponse(frames, media_type="multipart/x-mixed-replace; boundary=frame")
 
@@ -253,7 +270,9 @@ async def _history_query[T](query: Awaitable[T]) -> T:
             status_code=503, detail="history is unavailable: the database did not respond in time"
         ) from None
     except Exception as exc:
-        logger.warning("history.query_failed", error=str(exc))
+        # Never `str(exc)`: for a SQLAlchemy error that is the statement, the bound
+        # parameters and the driver's message, which can quote row values.
+        logger.warning("history.query_failed", **describe_db_error(exc))
         raise HTTPException(
             status_code=503, detail="history is unavailable: the database query failed"
         ) from None

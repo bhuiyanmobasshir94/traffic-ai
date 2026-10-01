@@ -265,9 +265,17 @@ async def test_comparison_is_constant_time(
         # A request with no credential has nothing to compare, and must not.
         await client.get("/api/cameras")
 
+    # Every presented credential is compared twice: once by the rate limiter, to recognise
+    # a trusted caller and not throttle it, and once by `AuthMiddleware`, which makes the
+    # real decision and deliberately trusts nothing the limiter concluded (a flag passed
+    # between layers is a decision a reordered stack would silently skip). The point of
+    # this test stands: both are `compare_digest`, and a credential-less request has
+    # nothing to compare.
     assert [(a, b, ok) for a, b, ok in calls] == [
-        (TOKEN.encode(), TOKEN.encode(), True),
-        (b"nope", TOKEN.encode(), False),
+        (TOKEN.encode(), TOKEN.encode(), True),  # rate limiter
+        (TOKEN.encode(), TOKEN.encode(), True),  # AuthMiddleware
+        (b"nope", TOKEN.encode(), False),  # rate limiter
+        (b"nope", TOKEN.encode(), False),  # AuthMiddleware
     ]
 
 

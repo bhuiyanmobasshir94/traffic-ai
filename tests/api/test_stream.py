@@ -99,3 +99,102 @@ async def test_mjpeg_frames_absorbs_cancellation(store, camera) -> None:
     await asyncio.sleep(0.02)
     task.cancel()
     await task  # must not raise — the generator returns cleanly instead
+
+
+# --- shutdown: an open stream must not hold the server up ---------------------------
+#
+# A viewer on a healthy pipeline never hits the stall exit, so without the shutdown event a
+# single open tab keeps the stream (and so the graceful shutdown) alive until the
+# orchestrator kills the container.
+
+
+async def test_mjpeg_frames_ends_when_the_stop_event_is_set(store, camera) -> None:
+    await store.publish_frame(camera.camera_id, b"\xff\xd8frame")
+    stop = asyncio.Event()
+    # A `ttl_seconds` far beyond the test: nothing but the event can end this stream.
+    frames = _mjpeg_frames(store, camera.camera_id, fps=200.0, ttl_seconds=3600.0, stop=stop)
+    received: list[bytes] = []
+
+    async def consume() -> None:
+        async for chunk in frames:
+            received.append(chunk)
+
+    consumer = asyncio.create_task(consume())
+    await asyncio.sleep(0.05)
+    assert received, "the stream should be live before it is told to stop"
+    assert not consumer.done()
+
+    stop.set()
+    # `asyncio.wait`, not `wait_for`: `_mjpeg_frames` swallows `CancelledError` (a client
+    # disconnect is not an error), so when `wait_for` times out and cancels the consumer, the
+    # consumer "finishes" normally and `wait_for` returns without ever raising -- a stream that
+    # ignores `stop` would pass. `asyncio.wait` does not cancel; `done` says what happened.
+    done, _ = await asyncio.wait({consumer}, timeout=2.0)
+    try:
+        assert consumer in done, "the stream kept running after the stop event was set"
+        assert consumer.exception() is None
+    finally:
+        consumer.cancel()  # a regressed stream must not outlive the test
+
+
+async def test_mjpeg_frames_sends_nothing_when_already_stopped(store, camera) -> None:
+    await store.publish_frame(camera.camera_id, b"\xff\xd8frame")
+    stop = asyncio.Event()
+    stop.set()
+
+    frames = _mjpeg_frames(store, camera.camera_id, fps=200.0, ttl_seconds=3600.0, stop=stop)
+
+    async def collect() -> list[bytes]:
+        return [chunk async for chunk in frames]
+
+    collector = asyncio.create_task(collect())
+    done, _ = await asyncio.wait({collector}, timeout=2.0)  # see the note above on `wait_for`
+    try:
+        assert collector in done, "the stream kept running although the stop event was already set"
+        assert collector.result() == []
+    finally:
+        collector.cancel()
+
+
+async def test_the_stream_route_ends_when_the_app_is_shutting_down(
+    app_factory, running_app, store, camera
+) -> None:
+    """The route hands the app's own shutdown event to the generator."""
+    await store.publish_frame(camera.camera_id, b"\xff\xd8frame")
+    app = app_factory()
+    async with running_app(app) as client:
+        app.state.shutdown_event.set()
+        request = asyncio.create_task(client.get(f"/api/cameras/{camera.camera_id}/stream.mjpg"))
+        done, _ = await asyncio.wait({request}, timeout=2.0)  # not `wait_for`: see above
+        try:
+            assert request in done, "the stream stayed open although the app is shutting down"
+            resp = request.result()
+        finally:
+            request.cancel()
+    assert resp.status_code == 200
+    assert resp.content == b""
+
+
+async def test_an_open_stream_is_ended_by_the_lifespan_teardown(
+    app_factory, running_app, store, camera
+) -> None:
+    """End to end: a stream that is mid-flight when the app begins shutting down ends on its
+    own once teardown starts -- the app is not left waiting on it."""
+    await store.publish_frame(camera.camera_id, b"\xff\xd8frame")
+    app = app_factory()
+    async with running_app(app) as client:
+        open_stream = asyncio.create_task(
+            client.get(f"/api/cameras/{camera.camera_id}/stream.mjpg")
+        )
+        await asyncio.sleep(0.1)
+        assert not open_stream.done(), "the stream should still be open while the app is serving"
+    # Leaving `running_app` ran the lifespan teardown, which sets the shutdown event.
+
+    done, _ = await asyncio.wait({open_stream}, timeout=2.0)  # not `wait_for`: see above
+    try:
+        assert open_stream in done, "the open stream was not ended by the lifespan teardown"
+        resp = open_stream.result()
+    finally:
+        open_stream.cancel()
+    assert resp.status_code == 200
+    assert b"\xff\xd8frame" in resp.content

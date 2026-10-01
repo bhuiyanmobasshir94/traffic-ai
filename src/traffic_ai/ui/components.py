@@ -53,6 +53,22 @@ def render_sidebar() -> None:
         st.sidebar.markdown("**Graaho Technologies**")
 
 
+# The detections and counts are measured, but the video they are measured on is a short
+# recording played on a loop. A running total therefore grows with how long the worker
+# has been up and how many times the clip has repeated -- a viewer reading it as traffic
+# volume would be misled, so every page that shows counts says so.
+DEMO_FOOTAGE_NOTICE = (
+    "Demo footage: the camera feeds are short recordings played on a loop, so counts and "
+    "history totals reflect how long the worker has been running and how many times the "
+    "footage has looped, not real traffic."
+)
+
+
+def render_demo_footage_notice() -> None:
+    """The disclosure above, as plain text (no HTML, so nothing to escape)."""
+    st.caption(DEMO_FOOTAGE_NOTICE)
+
+
 def _build_stream_markup(camera_id: str, public_base_url: str) -> str | None:
     """Pure helper behind `render_live_video`: returns the escaped `<img>`
     markup for a known camera, or `None` for an unknown one.
@@ -182,12 +198,21 @@ def render_events(events: list[CrossingEvent]) -> None:
         st.caption("ANPR stage not enabled — plates are not read.")
 
 
-def render_status_banner(state: CameraState | None, healthy: bool) -> None:
-    """Explicit states: worker unreachable / no data yet / stale / running.
+def render_status_banner(
+    state: CameraState | None, healthy: bool, *, unauthorized: str | None = None
+) -> None:
+    """Explicit states: not authorized / worker unreachable / no data yet / stale / running.
 
     A stale dashboard says so rather than looking live — `CameraState.is_stale`
     is the single source of that judgment.
+
+    `unauthorized` is the message of an `ApiUnauthorized`, and takes precedence: a
+    worker that answered 401 is up and reachable, so "worker unreachable" would send an
+    operator to debug the network when the fix is the token.
     """
+    if unauthorized is not None:
+        st.error(unauthorized)
+        return
     if not healthy:
         st.error("Worker unreachable. The map still renders; live data resumes once it's back.")
         return

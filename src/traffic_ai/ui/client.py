@@ -220,6 +220,25 @@ class WorkerClient:
         params = _window_params(camera_id, since, until)
         return self._get_history("/history/hourly", params, HistoryHourly.model_validate)
 
+    def history_events_lost(self) -> int | None:
+        """Crossings the worker counted but failed to persist, from `/readyz`.
+
+        `None` means unknown: persistence is off, the worker did not say, or it could
+        not be asked. Never raises -- this only feeds an advisory warning, so a failure
+        to ask must not take the page it decorates down. `/readyz` answers 503 when the
+        worker is not ready but still carries the body, so the status code is not
+        checked; and it is an auth-exempt path, so a bad token cannot reach this.
+        """
+        try:
+            body = self._client.get("/readyz").json()
+        except (httpx.HTTPError, ValueError):
+            return None
+        lost = body.get("history_events_lost") if isinstance(body, dict) else None
+        # `bool` is an `int`, and a negative count is not a count.
+        if isinstance(lost, int) and not isinstance(lost, bool) and lost >= 0:
+            return lost
+        return None
+
     def healthy(self) -> bool:
         """Liveness probe for the status banner. Never raises."""
         try:

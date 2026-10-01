@@ -15,7 +15,9 @@ from datetime import UTC, datetime
 
 import pytest
 import structlog
+from sqlalchemy.exc import DBAPIError
 
+from traffic_ai import metrics
 from traffic_ai.db import writer as writer_module
 from traffic_ai.db.writer import CrossingWriter
 from traffic_ai.domain import CrossingEvent, Direction
@@ -221,8 +223,163 @@ async def test_a_failed_flush_is_logged(monkeypatch: pytest.MonkeyPatch) -> None
     failed = [entry for entry in logs if entry["event"] == "db.flush_failed"]
     assert len(failed) == 1
     assert failed[0]["error"] == "database unavailable"
+    assert failed[0]["error_type"] == "RuntimeError"
     assert failed[0]["batch_size"] == 1
+    assert failed[0]["lost"] == 1
     assert failed[0]["log_level"] == "warning"
+
+
+async def test_a_failed_flush_logs_no_statement_parameters_or_driver_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`str()` of a SQLAlchemy error is the SQL, its bound parameters (crossing rows, and
+    plate text once a model exists) and the driver message, which Postgres fills with
+    `DETAIL: Key (...)=(...)`. None of it may reach a log line."""
+    error = DBAPIError(
+        "INSERT INTO crossing_events (plate_text) VALUES (%s)",
+        ("SECRET-PLATE-0042",),
+        Exception("duplicate key. DETAIL: Key (plate_text)=(SECRET-PLATE-0042) already exists."),
+    )
+    sink = _AlwaysFailingSink(error=error)
+    writer = CrossingWriter(sink, flush_interval_seconds=60.0, flush_max_batch=100)
+    writer.submit(_event(0))
+
+    with structlog.testing.capture_logs() as logs:
+        monkeypatch.setattr(writer_module, "log", structlog.get_logger("traffic_ai.db.writer"))
+        task = asyncio.create_task(writer.run())
+        await _stop(writer, task)
+
+    (failed,) = [entry for entry in logs if entry["event"] == "db.flush_failed"]
+    assert failed["error_type"] == "DBAPIError"
+    assert failed["error"] == "Exception"  # the driver exception's class, not its message
+    assert "SECRET-PLATE-0042" not in repr(logs)
+    assert "crossing_events" not in repr(logs)
+
+
+# --- lost events are counted, and a poison row does not take a whole batch ----------
+
+
+def _lost(reason: str) -> float:
+    """Current value of `history_events_lost_total{reason}`. The registry is process-wide,
+    so every assertion is a delta against a reading taken first."""
+    return metrics.registry.get_sample_value("history_events_lost_total", {"reason": reason}) or 0.0
+
+
+class _PoisonSink(_StubSink):
+    """Rejects any batch containing a poison track id, as one bad row fails an INSERT."""
+
+    def __init__(self, poison: set[int]) -> None:
+        super().__init__()
+        self._poison = poison
+
+    async def add_many(self, events: Sequence[CrossingEvent]) -> int:
+        if any(e.track_id in self._poison for e in events):
+            self.calls += 1
+            raise ValueError("a row the database refuses")
+        return await super().add_many(events)
+
+
+def test_both_loss_series_exist_before_anything_is_lost() -> None:
+    """So `increase()` sees the first loss rather than a series appearing already at 1."""
+    for reason in ("buffer_full", "flush_failed"):
+        assert (
+            metrics.registry.get_sample_value("history_events_lost_total", {"reason": reason})
+            is not None
+        )
+
+
+async def test_a_poison_row_loses_half_a_batch_not_all_of_it() -> None:
+    sink = _PoisonSink({2})
+    writer = CrossingWriter(sink, flush_interval_seconds=60.0, flush_max_batch=8)
+    for n in range(8):
+        writer.submit(_event(n))
+    before = _lost("flush_failed")
+
+    task = asyncio.create_task(writer.run())
+    await _stop(writer, task)
+
+    # The whole batch failed; the half without the poison row was retried and saved.
+    assert sink.batches == [[4, 5, 6, 7]]
+    assert writer.lost_count == 4  # the half that held the poison row
+    assert _lost("flush_failed") - before == 4
+    assert task.exception() is None
+
+
+async def test_a_transient_failure_that_clears_on_the_split_loses_nothing() -> None:
+    sink = _StubSink(fail_first=1)
+    writer = CrossingWriter(sink, flush_interval_seconds=60.0, flush_max_batch=4)
+    for n in range(4):
+        writer.submit(_event(n))
+    before = _lost("flush_failed")
+
+    task = asyncio.create_task(writer.run())
+    await _stop(writer, task)
+
+    assert sink.batches == [[0, 1], [2, 3]]
+    assert writer.lost_count == 0
+    assert _lost("flush_failed") - before == 0
+
+
+async def test_the_retry_is_one_split_not_a_bisection() -> None:
+    """During an outage every attempt is a failing round trip. A batch costs three (the
+    whole, then each half) however large it is, not one per row."""
+    sink = _AlwaysFailingSink()
+    writer = CrossingWriter(sink, flush_interval_seconds=60.0, flush_max_batch=64)
+    for n in range(64):
+        writer.submit(_event(n))
+    before = _lost("flush_failed")
+
+    task = asyncio.create_task(writer.run())
+    await _stop(writer, task)
+
+    assert sink.calls == 3
+    assert writer.lost_count == 64
+    assert _lost("flush_failed") - before == 64
+
+
+async def test_a_failed_single_event_batch_is_counted_not_retried() -> None:
+    sink = _AlwaysFailingSink()
+    writer = CrossingWriter(sink, flush_interval_seconds=60.0, flush_max_batch=100)
+    writer.submit(_event(0))
+    before = _lost("flush_failed")
+
+    task = asyncio.create_task(writer.run())
+    await _stop(writer, task)
+
+    assert sink.calls == 1  # nothing to split
+    assert writer.lost_count == 1
+    assert _lost("flush_failed") - before == 1
+
+
+async def test_buffer_evictions_and_failed_batches_both_count_toward_lost() -> None:
+    sink = _AlwaysFailingSink()
+    writer = CrossingWriter(sink, flush_interval_seconds=60.0, flush_max_batch=100, buffer_limit=3)
+    full_before, failed_before = _lost("buffer_full"), _lost("flush_failed")
+
+    for n in range(5):
+        writer.submit(_event(n))
+    assert writer.lost_count == 2  # 0 and 1 were evicted, before any flush
+    assert _lost("buffer_full") - full_before == 2
+
+    task = asyncio.create_task(writer.run())
+    await _stop(writer, task)
+
+    assert writer.lost_count == 5  # ...and the 3 that survived were refused by the database
+    assert _lost("flush_failed") - failed_before == 3
+    assert writer.dropped_count == 2  # the existing counter still means evictions only
+
+
+async def test_nothing_lost_means_a_zero_count() -> None:
+    sink = _StubSink()
+    writer = CrossingWriter(sink, flush_interval_seconds=60.0, flush_max_batch=100)
+    for n in range(3):
+        writer.submit(_event(n))
+
+    task = asyncio.create_task(writer.run())
+    await _stop(writer, task)
+
+    assert sink.delivered == [0, 1, 2]
+    assert writer.lost_count == 0
 
 
 # --- bounded buffer -----------------------------------------------------------

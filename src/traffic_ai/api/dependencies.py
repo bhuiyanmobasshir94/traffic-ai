@@ -105,8 +105,18 @@ def get_history_window(
                 detail=f"{name} must include a UTC offset (e.g. 2026-03-01T10:00:00Z)",
             )
 
-    end = until.astimezone(UTC) if until is not None else datetime.now(UTC)
-    start = since.astimezone(UTC) if since is not None else end - DEFAULT_HISTORY_WINDOW
+    # Converting to UTC can leave the representable range (`9999-12-31T23:59:59-05:00` is
+    # year 10000 in UTC), and so can stepping back a default window from a very early
+    # `until`. Both raise `OverflowError`, which would surface as a 500 for what is a
+    # malformed request.
+    try:
+        end = until.astimezone(UTC) if until is not None else datetime.now(UTC)
+        start = since.astimezone(UTC) if since is not None else end - DEFAULT_HISTORY_WINDOW
+    except OverflowError:
+        raise HTTPException(
+            status_code=422,
+            detail="since and until must be representable as UTC datetimes",
+        ) from None
 
     if start >= end:
         raise HTTPException(status_code=422, detail="since must be earlier than until")

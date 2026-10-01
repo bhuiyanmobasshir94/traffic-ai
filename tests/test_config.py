@@ -169,3 +169,99 @@ class TestHardeningDefaults:
     def test_metrics_path_sits_under_the_api_prefix(self) -> None:
         """So the existing Traefik /api router reaches it and the token covers it."""
         assert build().metrics_path.startswith("/api")
+
+
+class TestTokenWhitespaceAndControlCharacters:
+    """A token with a trailing newline (the usual secret-file accident) cannot be sent as a
+    header value, so every client fails to authenticate -- silently, from the operator's seat.
+    Refused at startup, in every environment, by a message that never quotes the token."""
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            "a" * 40 + "\n",
+            "a" * 40 + "\r\n",
+            " " + "a" * 40,
+            "a" * 20 + " " + "a" * 20,
+            "a" * 20 + "\t" + "a" * 20,
+            "a" * 40 + "\x00",
+            "a" * 40 + "\x1b",
+            "a" * 40 + chr(0xA0),  # no-break space
+            "a" * 40 + chr(0x200B),  # zero-width space: not whitespace, not printable
+        ],
+    )
+    @pytest.mark.parametrize("environment", ["development", "production"])
+    def test_a_token_containing_whitespace_or_a_control_character_is_refused(
+        self, token: str, environment: str
+    ) -> None:
+        with pytest.raises(ValidationError) as caught:
+            build(environment=environment, api_token=token, database_url=REAL_DB_URL)
+
+        message = problems_from(caught.value)
+        assert "TRAFFIC_AI_API_TOKEN contains whitespace or a control character" in message
+        assert "a" * 40 not in message  # the value is never echoed
+
+    def test_a_clean_token_with_punctuation_is_accepted(self) -> None:
+        token = "Zx9-_.~+/=" + "k" * 30
+        assert build(api_token=token).api_token.get_secret_value() == token  # type: ignore[union-attr]
+
+    def test_an_all_whitespace_token_is_still_just_absent(self) -> None:
+        """Blank is the compose `${VAR:-}` case, handled before this check: not an error."""
+        assert build(api_token="\n").api_token is None  # noqa: S106 - a test value
+
+
+class TestErrorsDoNotQuoteSecrets:
+    """The production gate raises from a model-level validator, whose "input" is the whole
+    settings dict. By default pydantic prints it in the error, token and database URL included,
+    straight into the container log of a service that has just refused to start."""
+
+    SECRET_TOKEN = "SENTINEL-token-" + "q" * 30
+    SECRET_URL = "postgresql+asyncpg://traffic:SENTINEL-db-password@db:5432/traffic_ai"  # noqa: S105
+
+    def test_the_production_gate_error_names_the_problem_but_not_the_token(self) -> None:
+        with pytest.raises(ValidationError) as caught:
+            # Dev password in the URL trips the gate, with a real-looking token alongside.
+            build(
+                environment="production",
+                api_token=self.SECRET_TOKEN,
+                database_url="postgresql+asyncpg://traffic:traffic@db:5432/traffic_ai",
+            )
+
+        message = problems_from(caught.value)
+        assert "development password" in message  # it is the gate speaking
+        assert self.SECRET_TOKEN not in message
+        assert "input_value" not in message
+
+    def test_the_gate_error_does_not_quote_the_database_url_either(self) -> None:
+        with pytest.raises(ValidationError) as caught:
+            build(
+                environment="production",
+                api_token="short",  # noqa: S106 - a deliberately weak test value
+                database_url=self.SECRET_URL,
+            )
+
+        message = problems_from(caught.value)
+        assert f"shorter than {MIN_API_TOKEN_LENGTH}" in message
+        assert "SENTINEL-db-password" not in message
+
+    def test_a_field_validation_error_does_not_quote_its_input_either(self) -> None:
+        with pytest.raises(ValidationError) as caught:
+            build(state_ttl_seconds="SENTINEL-not-a-number")
+
+        assert "SENTINEL-not-a-number" not in problems_from(caught.value)
+
+
+class TestTrustedProxyHops:
+    def test_defaults_to_one_proxy_the_compose_stack(self) -> None:
+        assert build().trusted_proxy_hops == 1
+
+    def test_zero_is_allowed_for_a_worker_with_no_proxy_in_front(self) -> None:
+        assert build(trusted_proxy_hops=0).trusted_proxy_hops == 0
+
+    def test_a_negative_count_is_refused(self) -> None:
+        with pytest.raises(ValidationError):
+            build(trusted_proxy_hops=-1)
+
+    def test_is_read_from_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TRAFFIC_AI_TRUSTED_PROXY_HOPS", "2")
+        assert build().trusted_proxy_hops == 2

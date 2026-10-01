@@ -10,8 +10,9 @@ import streamlit as st
 
 from traffic_ai.config import get_settings
 from traffic_ai.domain import CrossingEvent
-from traffic_ai.ui.client import WorkerUnavailable, get_worker_client
+from traffic_ai.ui.client import ApiUnauthorized, WorkerUnavailable, get_worker_client
 from traffic_ai.ui.components import (
+    render_demo_footage_notice,
     render_events,
     render_live_video,
     render_map,
@@ -37,6 +38,7 @@ def render_dashboard(*, page_key: str, title: str, default_camera_id: str) -> No
 
     render_sidebar()
     st.title(title)
+    render_demo_footage_notice()
 
     client = get_worker_client()
     settings = get_settings()
@@ -44,6 +46,10 @@ def render_dashboard(*, page_key: str, title: str, default_camera_id: str) -> No
 
     try:
         states = client.states() if healthy else {}
+    except ApiUnauthorized:
+        # Not "unreachable": the live region below says what is wrong. The map still
+        # renders, with no per-camera state on it.
+        states = {}
     except WorkerUnavailable:
         states = {}
         healthy = False
@@ -70,13 +76,18 @@ def _render_live_region(*, camera_id: str) -> None:
     healthy = client.healthy()
     state = None
     events: list[CrossingEvent] = []
+    unauthorized: str | None = None
     if healthy:
         try:
             state = client.state(camera_id)
             events = client.events(camera_id, limit=25)
+        except ApiUnauthorized as exc:
+            # `ApiUnauthorized` is a `WorkerUnavailable`, so it must be caught first. The
+            # liveness probe is auth-exempt, which is why `healthy` is still True here.
+            unauthorized = str(exc)
         except WorkerUnavailable:
             healthy = False
 
-    render_status_banner(state, healthy)
+    render_status_banner(state, healthy, unauthorized=unauthorized)
     render_stats(state)
     render_events(events)

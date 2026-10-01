@@ -35,6 +35,11 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        # A ValidationError normally quotes the input that failed, and a model-level
+        # validator's input is the whole settings dict -- `api_token` and the database
+        # URL included. The production gate raises exactly that error, and startup
+        # failures land in container logs and crash reports.
+        hide_input_in_errors=True,
     )
 
     environment: Literal["development", "production"] = "development"
@@ -123,6 +128,14 @@ class Settings(BaseSettings):
     # The MJPEG stream is one long-lived request per viewer, so it is counted
     # separately and far more tightly than ordinary JSON calls.
     rate_limit_stream_requests: int = Field(default=10, ge=1)
+    # How many reverse proxies sit between the internet and this process, i.e. how many
+    # entries from the RIGHT of `X-Forwarded-For` are appended by infrastructure we
+    # control. The client address is the entry that many places from the right: each
+    # proxy appends the address it received the request from, so everything to the LEFT
+    # of that entry was supplied by the caller and is not to be believed. 1 is the compose
+    # stack (Traefik only). 0 ignores the header and keys on the socket peer -- the right
+    # value when the worker is reachable without a proxy, where the header is pure spoofing.
+    trusted_proxy_hops: int = Field(default=1, ge=0)
     security_headers_enabled: bool = True
     hsts_max_age_seconds: int = Field(default=31_536_000, ge=0)  # one year
 
@@ -157,6 +170,31 @@ class Settings(BaseSettings):
         """
         if isinstance(value, str) and not value.strip():
             return None
+        return value
+
+    @field_validator("api_token", mode="after")
+    @classmethod
+    def _token_has_no_whitespace_or_control_characters(
+        cls, value: SecretStr | None
+    ) -> SecretStr | None:
+        """Refuse a token that cannot survive being sent as a header value.
+
+        The usual cause is a trailing newline from a secret file or `echo`. The server
+        would compare against the newline-bearing string while every client strips or
+        rejects it, so authentication fails for everyone with no hint why -- and the
+        h11 error a bad header value produces quotes the whole header, token included.
+        Checked in every environment because the mismatch is just as real on a laptop.
+        The message names the problem and never the value.
+        """
+        if value is None:
+            return None
+        token = value.get_secret_value()
+        if any(ch.isspace() or not ch.isprintable() for ch in token):
+            raise ValueError(
+                "TRAFFIC_AI_API_TOKEN contains whitespace or a control character (a trailing "
+                "newline from a secret file is the usual cause). Strip it, or generate one "
+                "with `openssl rand -hex 32`."
+            )
         return value
 
     @model_validator(mode="after")

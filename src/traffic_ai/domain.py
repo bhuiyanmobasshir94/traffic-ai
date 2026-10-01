@@ -143,6 +143,11 @@ class ReadinessResponse(BaseModel):
     # database must not pull the instance out of rotation while live state still
     # serves. `None` means persistence is switched off, which is not a failure.
     database: bool | None = None
+    # Crossings the history writer has counted live but will never persist (buffer
+    # evictions plus batches the database refused), since the worker started. Also
+    # reported-not-gating. `None` means there is no writer to ask -- persistence is
+    # off, or its setup failed -- never "zero lost".
+    history_events_lost: int | None = None
 
 
 class HistoryCounts(BaseModel):

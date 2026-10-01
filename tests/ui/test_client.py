@@ -592,3 +592,51 @@ def test_build_worker_client_treats_a_blank_token_as_none() -> None:
 
     settings = _settings(api_token="")
     build_worker_client(settings, transport=httpx.MockTransport(handler)).cameras()
+
+
+# --- history_events_lost (advisory: unknown is None, never an error) -----------
+
+
+@pytest.mark.parametrize("status", [200, 503])
+def test_history_events_lost_reads_the_count_whatever_the_readiness_status(status: int) -> None:
+    """`/readyz` is 503 when the worker is not ready but the body is still the answer."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/readyz"
+        return httpx.Response(status, json={"ready": status == 200, "history_events_lost": 7})
+
+    assert _client(handler).history_events_lost() == 7
+
+
+def test_history_events_lost_zero_is_a_real_zero() -> None:
+    client = _client(lambda request: httpx.Response(200, json={"history_events_lost": 0}))
+    assert client.history_events_lost() == 0
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"history_events_lost": None},  # persistence off: not "zero lost"
+        {"ready": True},  # an older worker that does not report it
+        {"history_events_lost": -1},
+        {"history_events_lost": True},  # a bool is not a count
+        {"history_events_lost": "7"},
+        [],
+        "nope",
+    ],
+)
+def test_history_events_lost_is_none_when_the_worker_did_not_say(body: object) -> None:
+    client = _client(lambda request: httpx.Response(200, json=body))
+    assert client.history_events_lost() is None
+
+
+def test_history_events_lost_is_none_when_the_worker_cannot_be_asked() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    assert _client(handler).history_events_lost() is None
+
+
+def test_history_events_lost_is_none_for_a_non_json_body() -> None:
+    client = _client(lambda request: httpx.Response(502, text="<html>bad gateway</html>"))
+    assert client.history_events_lost() is None

@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from sqlalchemy import text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from traffic_ai.config import Settings
+from traffic_ai.db.models import CrossingEventRow
 
 
 class Database:
@@ -43,6 +44,10 @@ class Database:
             # detected on checkout and replaced, rather than surfacing as a failed
             # query on whichever request happened to draw it.
             pool_pre_ping=True,
+            # Bound parameters are crossing rows -- and plate text, once a plate model
+            # exists. Without this every `DBAPIError` message, and so every traceback
+            # and log line that carries one, embeds them.
+            hide_parameters=True,
         )
         return cls(engine)
 
@@ -58,10 +63,20 @@ class Database:
                 raise
 
     async def ping(self) -> bool:
-        """Liveness probe for the readiness endpoint. Never raises."""
+        """Readiness probe: True only when history can actually be written and read.
+
+        Connectivity alone is not enough. A freshly provisioned Postgres that has not
+        been migrated answers `SELECT 1` happily while every flush and every history
+        query fails on the missing table -- the readiness endpoint would report a
+        healthy database while all history is being lost. So the probe selects the
+        mapped columns of `crossing_events` with `LIMIT 0`: it fails when the table or
+        a column is absent, and costs one round trip and no row reads when it is not.
+
+        Never raises. The caller bounds the wait (`routes._DATABASE_PROBE_TIMEOUT_SECONDS`).
+        """
         try:
             async with self._engine.connect() as conn:
-                await conn.execute(text("SELECT 1"))
+                await conn.execute(select(CrossingEventRow).limit(0))
             return True
         except Exception:
             # Same contract as `StateStore.ping`: a probe reports False, it does

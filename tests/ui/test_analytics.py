@@ -88,8 +88,22 @@ def _client(handler, *, token: str | None = None) -> WorkerClient:
     )
 
 
+def _readyz_body(*, lost: int | None = 0) -> dict[str, object]:
+    return {
+        "ready": True,
+        "redis": True,
+        "cameras_running": 2,
+        "cameras_total": 2,
+        "detail": None,
+        "database": True,
+        "history_events_lost": lost,
+    }
+
+
 def _healthy_handler(request: httpx.Request) -> httpx.Response:
     path = request.url.path
+    if path == "/api/readyz":
+        return httpx.Response(200, json=_readyz_body())
     if path == "/api/history/counts":
         return httpx.Response(200, json=_COUNTS_BODY)
     if path == "/api/history/hourly":
@@ -450,8 +464,11 @@ def test_all_cameras_sends_no_camera_filter_and_a_selected_camera_does(
     at.selectbox(key="analytics:camera").select(CAMERAS[1].camera_id).run(timeout=15)
 
     assert len(at.exception) == 0
-    assert requests
-    assert {r.url.params["camera_id"] for r in requests} == {CAMERAS[1].camera_id}
+    # The readiness lookup behind the "totals may be incomplete" warning is not a history
+    # query and carries no camera filter, so only the `/history/*` requests are checked.
+    history = [r for r in requests if r.url.path.startswith("/api/history/")]
+    assert history
+    assert {r.url.params["camera_id"] for r in history} == {CAMERAS[1].camera_id}
 
 
 def test_window_selector_changes_the_requested_range(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -473,3 +490,111 @@ def test_page_state_is_namespaced_so_it_cannot_collide_with_the_other_pages(
     at = _run()
 
     assert set(at.session_state.to_dict()) == {"analytics:camera", "analytics:window"}
+
+
+# --- lost history events: totals that may be short must say so -------------------
+
+
+def _with_readyz(readyz: object):
+    """`_healthy_handler`, but `/readyz` answers with `readyz` (or raises if it is an
+    exception), so a test controls only what the lost-events lookup sees."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/readyz":
+            if isinstance(readyz, Exception):
+                raise readyz
+            return httpx.Response(200, json=readyz)
+        return _healthy_handler(request)
+
+    return handler
+
+
+def test_fetch_history_carries_the_lost_event_count() -> None:
+    view = _fetch(_client(_with_readyz(_readyz_body(lost=3))))
+
+    assert view.status is HistoryStatus.OK
+    assert view.events_lost == 3
+
+
+def test_fetch_history_has_no_lost_count_when_the_worker_did_not_report_one() -> None:
+    assert _fetch(_client(_with_readyz(_readyz_body(lost=None)))).events_lost is None
+
+
+def test_page_warns_that_totals_may_be_incomplete_when_events_were_lost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install(monkeypatch, _with_readyz(_readyz_body(lost=4)))
+    at = _run()
+
+    assert len(at.exception) == 0
+    (warning,) = at.warning
+    assert "4 crossing(s)" in warning.value
+    assert "may be incomplete" in warning.value
+    # The totals are still shown: the warning qualifies them, it does not replace them.
+    assert [m.value for m in at.metric] == ["27", "16", "11"]
+
+
+def test_page_warns_on_an_empty_window_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty window is the case where lost events most plausibly explain what is on
+    screen, so "no crossings" must not stand unqualified."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/readyz":
+            return httpx.Response(200, json=_readyz_body(lost=2))
+        if request.url.path == "/api/history/counts":
+            return httpx.Response(200, json=_EMPTY_COUNTS_BODY)
+        if request.url.path == "/api/history/hourly":
+            return httpx.Response(200, json={**_HOURLY_BODY, "buckets": []})
+        return httpx.Response(200, json=[])
+
+    _install(monkeypatch, handler)
+    at = _run()
+
+    assert [i.value for i in at.info] == ["No crossings recorded in this window."]
+    assert any("may be incomplete" in w.value for w in at.warning)
+
+
+@pytest.mark.parametrize("lost", [0, None])
+def test_page_does_not_warn_when_nothing_was_lost_or_nothing_was_reported(
+    monkeypatch: pytest.MonkeyPatch, lost: int | None
+) -> None:
+    _install(monkeypatch, _with_readyz(_readyz_body(lost=lost)))
+    at = _run()
+
+    assert len(at.warning) == 0
+
+
+def test_page_still_renders_history_when_readiness_cannot_be_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The warning is advisory: failing to fetch it must not blank a page that loaded."""
+    request_failure = httpx.ConnectError("connection refused")
+    _install(monkeypatch, _with_readyz(request_failure))
+    at = _run()
+
+    assert len(at.exception) == 0
+    assert len(at.error) == 0
+    assert [m.value for m in at.metric] == ["27", "16", "11"]
+    assert len(at.warning) == 0
+
+
+# --- demo footage disclosure ------------------------------------------------------
+
+
+def test_page_discloses_that_the_footage_is_looped_demo_footage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install(monkeypatch, _healthy_handler)
+    at = _run()
+
+    captions = [c.value for c in at.caption]
+    assert any("looped" in c and "not real traffic" in c for c in captions)
+
+
+def test_the_disclosure_is_shown_even_when_history_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install(monkeypatch, lambda request: httpx.Response(503, json={"detail": "off"}))
+    at = _run()
+
+    assert any("looped" in c.value for c in at.caption)
