@@ -11,9 +11,10 @@ true, and it must not become true again: nothing in this repository may present 
 fabricated value as a measurement. The one deliberate gap is number-plate reading — see
 the ANPR note under Non-negotiables.
 
-It is still a demo. No user depends on it, no money moves, and it stores nothing. But it
-now processes video and runs a real pipeline, so a bug can burn CPU, wedge a container, or
-put a wrong number in front of a client.
+It is still a demo over looped footage. No money moves. Since 2026-10-01 it **stores
+crossing history in Postgres** (counts, classes, directions, timestamps, confidences —
+never a frame and never a plate) and sits behind authentication. A bug can burn CPU,
+wedge a container, lose or duplicate history, or put a wrong number in front of a client.
 
 Detailed standards live in `.claude/rules/` and load when you touch the paths they cover:
 
@@ -30,9 +31,21 @@ Detailed standards live in `.claude/rules/` and load when you touch the paths th
   runs via `asyncio.to_thread` in `worker/pipeline.py`. The whole rewrite exists because the
   old code slept on the script thread; never reintroduce `time.sleep` in a serving path.
 - **Redis is a cache with a TTL, not a database.** Every key expires
-  (`state_ttl_seconds`, default 30). Persistence is off. Counters reset when the worker
-  restarts — by design, so a dead worker cannot leave a dashboard that looks live. The UI
-  distinguishes live / stale / no-data and must keep doing so.
+  (`state_ttl_seconds`, default 30). Live counters reset when the worker restarts — by
+  design, so a dead worker cannot leave a dashboard that looks live. The UI distinguishes
+  live / stale / no-data and must keep doing so.
+- **Postgres is the system of record for history, and is never on the live path.**
+  `db/writer.py` batches crossings off the frame loop; a database outage loses history
+  (counted in `history_events_lost_total`) but never stops counting. History endpoints
+  return 503 when unavailable — never an empty result presented as real. The UI never
+  connects to Postgres; it reads `/api/history/*`. Schema changes are Alembic migrations
+  in `migrations/`, applied by compose's `migrate` service and Helm's hook Job.
+- **Auth is two layers.** Traefik BasicAuth at the edge (rate-limited), then a bearer
+  token the worker checks (`api/middleware.py`). Traefik swaps the browser's Basic header
+  for the bearer so the MJPEG `<img>` works. `Settings` refuses to start in production
+  with no/short/non-ASCII token or the dev database password — keep that gate.
+- **One worker replica.** Each worker runs every camera pipeline, so a second replica
+  duplicates history. Helm uses `Recreate` and has no worker HPA.
 - **`ultralytics` is AGPL-3.0 and this repo is MIT.** Detection sits behind the `Detector`
   Protocol in `worker/detection.py`. `Settings.detector` (`TRAFFIC_AI_DETECTOR`) defaults
   to `"torchvision"` (BSD-3-Clause, `TorchvisionDetector`), so the default deployment path
@@ -106,15 +119,18 @@ Every session that changes code, configuration, or documentation writes an entry
 ## Commands
 
 ```bash
-# Install (core + both extras + dev tooling)
-poetry install --extras "ui worker"
+# Install from uv.lock (torch/torchvision pinned to the PyTorch CPU index)
+make sync                   # uv sync --locked; `make install-pip` for plain pip
+make lock                   # after any pyproject dependency edit; CI fails a stale lock
 
 # Fetch the demo footage (~65MB, MD5-verified). Required before first run.
 make videos
 
 # Verify
-pytest                      # full suite; no torch required
+pytest                      # full suite; no torch required. Postgres tests run when
+                            # TRAFFIC_AI_TEST_DATABASE_URL is set; helm tests need `helm`
 ruff check . && ruff format --check .
+helm lint deploy/helm/traffic-ai
 
 # Run the whole stack locally (needs .env — copy .env.example)
 docker compose up --build

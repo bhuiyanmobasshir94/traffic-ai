@@ -266,3 +266,76 @@ the options in order are: raise `TRAFFIC_AI_DETECT_EVERY_N_FRAMES`, lower
 `TRAFFIC_AI_FRAME_WIDTH`, or set `TRAFFIC_AI_DETECTOR=ultralytics` and accept the AGPL
 obligation deliberately. Whether a commercial client demo should ship AGPL detection is the
 maintainer's call and is deliberately left open here.
+
+---
+
+## 2026-10-01 — Postgres becomes the system of record for history; Redis stays the live path
+
+**Decision.** Crossing events are durably stored in Postgres (async SQLAlchemy 2.0, Alembic
+migrations) through a batching `CrossingWriter`. Redis keeps its TTLs and remains the only
+thing the live dashboard reads. The UI never connects to Postgres; it reads `/api/history/*`.
+This supersedes "Telemetry is simulated; no persistence layer chosen" and narrows "Redis
+holds ephemeral state with a TTL, and is not a database" — that entry still holds for Redis.
+
+**Why.** The maintainer chose durable history (2026-10-01). Keeping Postgres off the live path
+preserves the live/stale/no-data guarantee: a database outage loses history, never counting.
+
+**Rules out.** Reading live state from Postgres; the UI holding a database connection;
+returning empty or zero history when the database is unavailable (it is 503); retrying a
+failed batch more than once (one split retry, then counted as lost in
+`history_events_lost_total`); more than one worker replica (each replica runs every pipeline
+and would duplicate rows — Helm uses `Recreate` and refuses a worker HPA).
+
+---
+
+## 2026-10-01 — Two-layer auth: Traefik BasicAuth at the edge, bearer token at the worker
+
+**Decision.** Humans authenticate once with BasicAuth at Traefik (rate-limited ahead of the
+check). On the worker router Traefik then replaces the browser's `Authorization: Basic` with
+`Authorization: Bearer <TRAFFIC_AI_API_TOKEN>`, which `AuthMiddleware` verifies with a
+constant-time byte compare. Health/readiness are exempt. Each router defines its own
+middlewares. `Settings` refuses production with no token, a token under 32 characters or
+outside visible ASCII, or the development database password.
+
+**Why.** A browser `<img>` cannot attach a header, so the MJPEG stream only works with auth
+on if the edge injects the token. Per-router middlewares keep the UI's login (and its stale
+banner) working when the worker container is down.
+
+**Rules out.** Token in a URL or markup; OIDC/IdP for now (rejected by the maintainer as
+more surface than needed); nginx `configuration-snippet` token injection (snippets are off by
+default and would put the token in rendered manifests). On Kubernetes, Traefik is therefore
+the production default ingress; ingress-nginx is supported but cannot play live video with
+the API token on.
+
+---
+
+## 2026-10-01 — In-process rate limiting with service-token exemption and trusted proxy hops
+
+**Decision.** The worker rate-limits per client IP in process memory. Requests carrying the
+valid service bearer (the UI's server-side calls) are exempt from the ordinary budget but not
+from the stream budget; health probes are exempt entirely. Client IP is the
+`X-Forwarded-For` entry `TRAFFIC_AI_TRUSTED_PROXY_HOPS` from the right (default 1 = Traefik),
+validated as an IP; the bucket table is capped.
+
+**Why.** Without the exemption two dashboard viewers exhausted the shared UI bucket and the
+dashboard flapped to "worker unavailable". Leftmost-XFF trust let any client mint buckets.
+
+**Rules out.** Treating the in-process limit as global: with N worker processes it is N×.
+That is acceptable only because the worker is a singleton; edge limits are the real gate.
+
+---
+
+## 2026-10-01 — Reproducible installs with uv.lock; supersedes "No lockfile"
+
+**Decision.** `pyproject.toml` is PEP 621 + hatchling; `uv.lock` is committed and every image
+and CI job installs `--locked`. torch and torchvision are pinned to the PyTorch CPU index in
+the lock via `[tool.uv.sources]`. `opencv-python` (pulled by ultralytics) is overridden out so
+`cv2` stays `opencv-python-headless` 4.x. CI fails a stale lock. Releases build amd64+arm64
+only after CI passes, with SBOM, provenance, and a (non-gating) Trivy scan; actions are
+SHA-pinned.
+
+**Why.** uv resolves the torch graph in seconds where Poetry 1.6 did not converge. Encoding the
+CPU index in the lock makes the "operator torchvision::nms does not exist" mismatch impossible
+rather than merely documented.
+
+**Rules out.** Poetry; installing torch outside the lock; `latest` tags on pre-releases.
