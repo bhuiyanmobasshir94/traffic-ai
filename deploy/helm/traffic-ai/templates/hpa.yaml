@@ -1,28 +1,16 @@
+{{- /*
+UI only. There is deliberately no worker HPA: every worker replica runs EVERY
+camera pipeline and writes its own copy of each crossing, so a second replica
+duplicates history (and fights over the live counters in Redis) instead of
+adding capacity. Asking for one is refused outright rather than rendered, since
+the result would be silently wrong data, not a visible failure.
+*/ -}}
+{{- if (default (dict) .Values.autoscaling.worker).enabled }}
+{{- fail "autoscaling.worker.enabled is not supported: each worker replica runs every camera pipeline and writes duplicate history, so the worker must stay at worker.replicaCount=1 (raise worker.resources or tune worker.env to add capacity). Only the UI can be autoscaled (autoscaling.enabled)." }}
+{{- end }}
 {{- if .Values.autoscaling.enabled }}
 # CPU-utilization scaling is measured against the container's resource
-# *request*, so it only means something because both Deployments set one.
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: {{ include "traffic-ai.worker.fullname" . }}
-  labels:
-    {{- include "traffic-ai.labels" . | nindent 4 }}
-    app.kubernetes.io/component: worker
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: {{ include "traffic-ai.worker.fullname" . }}
-  minReplicas: {{ .Values.autoscaling.worker.minReplicas }}
-  maxReplicas: {{ .Values.autoscaling.worker.maxReplicas }}
-  metrics:
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: {{ .Values.autoscaling.worker.targetCPUUtilizationPercentage }}
----
+# *request*, so it only means something because the Deployment sets one.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:

@@ -6,9 +6,15 @@ metadata:
     {{- include "traffic-ai.labels" . | nindent 4 }}
     app.kubernetes.io/component: worker
 spec:
-  {{- if not .Values.autoscaling.enabled }}
+  # Always rendered: no HPA ever owns the worker's replica count (hpa.yaml).
+  # Keep it at 1: each replica runs every pipeline and writes duplicate history.
   replicas: {{ .Values.worker.replicaCount }}
-  {{- end }}
+  # Recreate, not the default RollingUpdate: a rollout must never run the old
+  # and the new worker together, because for that window both would count the
+  # same vehicles and write the same crossings twice. The price is a gap while
+  # the old pod terminates and the new one starts (the dashboard shows stale).
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "traffic-ai.worker.selectorLabels" . | nindent 6 }}
@@ -30,6 +36,9 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      # SIGTERM to SIGKILL window: long enough for the pipelines to stop and the
+      # history writer to flush (values.yaml, worker.terminationGracePeriodSeconds).
+      terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds }}
       serviceAccountName: {{ include "traffic-ai.serviceAccountName" . }}
       automountServiceAccountToken: false
       {{- with .Values.imagePullSecrets }}

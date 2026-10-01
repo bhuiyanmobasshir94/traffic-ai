@@ -5,36 +5,59 @@ compose.yaml and the two Dockerfiles as text/YAML and assert the invariants
 docs/DEPLOYMENT.md and CLAUDE.md's non-negotiables depend on: only traefik is
 published to the host (redis, postgres and the worker never are), the /api
 router always wins over the UI catch-all, both routers sit behind BasicAuth with
-the bearer token injected AFTER it on /api, the schema migrates before the worker
-starts, every service has resource limits, no image floats on `:latest`, and the
-Traefik docker-socket mount is read-only.
+the bearer token injected AFTER it on /api and a rate limit in FRONT of the login,
+the schema migrates before the worker starts, every service has resource limits
+and a stop grace period that covers the worker's shutdown, no image floats on
+`:latest`, and the Traefik docker-socket mount is read-only.
 
 A few tests go one step further and feed the compose environment, with its
 `${VAR:-default}` interpolation resolved, into the real `Settings` production
 gate: that is the contract the compose comments promise, so it is checked against
 the code rather than against more strings.
+
+The same file also holds the checks on the rest of the deployment surface that
+is not Helm: the Makefile's destructive target, the CI and release workflows
+(SHA-pinned actions, images only after CI, no `latest` for pre-releases), and the
+runbooks' agreement with the code.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 import yaml
 
 from traffic_ai.config import Settings
+from traffic_ai.domain import ReadinessResponse
+from traffic_ai.metrics import render
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 COMPOSE_PATH = REPO_ROOT / "compose.yaml"
 GITIGNORE_PATH = REPO_ROOT / ".gitignore"
 HTPASSWD_EXAMPLE = REPO_ROOT / "config" / "traefik" / "users.htpasswd.example"
+MAKEFILE = REPO_ROOT / "Makefile"
+CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
+DEPLOYMENT_DOC = REPO_ROOT / "docs" / "DEPLOYMENT.md"
+KUBERNETES_DOC = REPO_ROOT / "docs" / "KUBERNETES.md"
+HELM_VALUES = [
+    REPO_ROOT / "deploy" / "helm" / "traffic-ai" / "values.yaml",
+    REPO_ROOT / "deploy" / "helm" / "traffic-ai" / "values-production.yaml",
+]
+APP_MODULE = REPO_ROOT / "src" / "traffic_ai" / "api" / "app.py"
+APP_MAIN_MODULE = REPO_ROOT / "src" / "traffic_ai" / "api" / "__main__.py"
 DEMO_VIDEO_FILENAMES = {"toll-plaza-a.mp4", "toll-plaza-b.mp4"}
 
 # Distinctive, and long enough to satisfy MIN_API_TOKEN_LENGTH.
 TEST_TOKEN = "t" * 64
 TEST_DB_PASSWORD = "a-real-database-password"  # noqa: S105 - a test value, not a credential
+# The two values the production gate demands of the worker; everything else is under test.
+LIMITER_ENV = {"TRAFFIC_AI_API_TOKEN": TEST_TOKEN, "POSTGRES_PASSWORD": TEST_DB_PASSWORD}
 
 # `${NAME}` or `${NAME:-default}` — the only interpolation forms compose.yaml uses.
 _INTERPOLATION = re.compile(r"\$\{(?P<name>\w+)(?::-(?P<default>[^}]*))?\}")
@@ -110,6 +133,39 @@ def _memory_bytes(value: str) -> int:
     match = re.fullmatch(r"(\d+)([KMG])", value)
     assert match, f"unparseable memory value {value!r}"
     return int(match.group(1)) * {"K": 1024, "M": 1024**2, "G": 1024**3}[match.group(2)]
+
+
+def _seconds(value: str) -> int:
+    match = re.fullmatch(r"(\d+)(s|m)", value)
+    assert match, f"unparseable duration {value!r}"
+    return int(match.group(1)) * {"s": 1, "m": 60}[match.group(2)]
+
+
+def _source_number(path: Path, name: str) -> float:
+    """Read `NAME = <number>` out of a source file without importing it.
+
+    The API modules build the app at import time; the shutdown budgets are read
+    from the text so the compose grace period is held to the real constants.
+    """
+    match = re.search(rf"^{name}\s*=\s*([0-9.]+)", path.read_text(encoding="utf-8"), re.MULTILINE)
+    assert match, f"{name} not found in {path}"
+    return float(match.group(1))
+
+
+def _workflow(path: Path) -> dict:
+    with path.open(encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def _workflow_triggers(workflow: dict) -> dict:
+    # YAML 1.1 reads a bare `on:` key as the boolean True.
+    triggers = workflow.get("on", workflow.get(True))
+    assert isinstance(triggers, dict)
+    return triggers
+
+
+def _workflow_steps(workflow: dict) -> list[dict]:
+    return [step for job in workflow["jobs"].values() for step in job.get("steps", [])]
 
 
 class TestNoPublishedInternalPorts:
@@ -519,3 +575,356 @@ class TestDemoVideoFilenamesMatchFetchScript:
         text = script_path.read_text(encoding="utf-8")
         filenames = set(re.findall(r'filename="([^"]+\.mp4)"', text))
         assert filenames == DEMO_VIDEO_FILENAMES
+
+
+class TestStopGracePeriods:
+    """Docker's 10s default would SIGKILL the worker mid-way through its history flush."""
+
+    def test_worker_grace_covers_the_applications_own_shutdown_budget(self, services: dict) -> None:
+        # uvicorn drains requests (GRACEFUL_SHUTDOWN_SECONDS), then the lifespan waits
+        # up to _SHUTDOWN_TIMEOUT_SECONDS for the pipelines and again for the history
+        # writer. Held to the constants in the code, not to a copy of their values.
+        needed = _source_number(APP_MAIN_MODULE, "GRACEFUL_SHUTDOWN_SECONDS") + 2 * _source_number(
+            APP_MODULE, "_SHUTDOWN_TIMEOUT_SECONDS"
+        )
+        granted = _seconds(services["worker"]["stop_grace_period"])
+        assert granted >= needed, f"stop_grace_period {granted}s is below the {needed}s budget"
+
+    def test_worker_and_ui_grace_periods_are_the_documented_values(self, services: dict) -> None:
+        assert services["worker"]["stop_grace_period"] == "30s"
+        assert services["ui"]["stop_grace_period"] == "15s"
+
+    def test_ui_grace_is_not_below_dockers_default(self, services: dict) -> None:
+        assert _seconds(services["ui"]["stop_grace_period"]) >= 10
+
+
+class TestEdgeRateLimit:
+    """BasicAuth has no lockout, so a Traefik rate limit must run in FRONT of it."""
+
+    ROUTERS = (("worker", "worker"), ("ui", "ui"))
+
+    @staticmethod
+    def _chain(services: dict, service_name: str, router: str) -> list[str]:
+        labels = services[service_name]["labels"]
+        return [_middleware_name(m) for m in _router_middlewares(labels, router)]
+
+    def _limiter(self, services: dict, service_name: str, router: str) -> str:
+        labels = services[service_name]["labels"]
+        limiters = [
+            name
+            for name in self._chain(services, service_name, router)
+            if _label_value(labels, f"traefik.http.middlewares.{name}.ratelimit.average")
+        ]
+        assert len(limiters) == 1, f"{router} router needs exactly one rate limit: {limiters}"
+        return limiters[0]
+
+    def test_both_routers_rate_limit_before_basic_auth(self, services: dict) -> None:
+        for service_name, router in self.ROUTERS:
+            labels = services[service_name]["labels"]
+            chain = self._chain(services, service_name, router)
+            limiter = self._limiter(services, service_name, router)
+            login = next(
+                n
+                for n in chain
+                if _label_value(labels, f"traefik.http.middlewares.{n}.basicauth.usersfile")
+            )
+            assert chain.index(limiter) < chain.index(login), (
+                f"{router}: a limiter after BasicAuth never sees the guesses it exists to slow"
+            )
+
+    def test_worker_chain_is_limit_then_login_then_bearer(self, services: dict) -> None:
+        assert self._chain(services, "worker", "worker") == [
+            "worker-ratelimit",
+            "worker-basicauth",
+            "api-bearer",
+        ]
+
+    def test_ui_chain_keeps_headers_first_so_a_429_carries_them(self, services: dict) -> None:
+        assert self._chain(services, "ui", "ui") == [
+            "ui-security-headers",
+            "ui-ratelimit",
+            "ui-basicauth",
+        ]
+
+    def test_each_router_has_its_own_limiter(self, services: dict) -> None:
+        # Shared with another container's labels, a limiter would vanish (404) with it.
+        worker = self._limiter(services, "worker", "worker")
+        ui = self._limiter(services, "ui", "ui")
+        assert worker != ui
+
+    def test_limits_are_set_and_the_burst_covers_the_average(self, services: dict) -> None:
+        for service_name, router in self.ROUTERS:
+            labels = services[service_name]["labels"]
+            name = self._limiter(services, service_name, router)
+            average = int(
+                _label_value(labels, f"traefik.http.middlewares.{name}.ratelimit.average")
+            )
+            burst = int(_label_value(labels, f"traefik.http.middlewares.{name}.ratelimit.burst"))
+            assert average >= 1
+            assert burst >= average
+
+    def test_bucket_key_is_the_peer_address_with_traefik_as_the_edge(self, services: dict) -> None:
+        # depth 0 ignores X-Forwarded-For: right while Traefik is the edge, wrong
+        # behind a load balancer (docs/DEPLOYMENT.md). The label must be explicit so
+        # the choice is visible rather than a default nobody looked at.
+        for service_name, router in self.ROUTERS:
+            labels = services[service_name]["labels"]
+            name = self._limiter(services, service_name, router)
+            key = f"traefik.http.middlewares.{name}.ratelimit.sourcecriterion.ipstrategy.depth"
+            assert _label_value(labels, key) == "0"
+
+
+class TestWorkerRateLimitAndProxyEnvironment:
+    """The worker's own limiter settings, and the proxy count it trusts."""
+
+    NAMES = (
+        "TRAFFIC_AI_RATE_LIMIT_ENABLED",
+        "TRAFFIC_AI_RATE_LIMIT_REQUESTS",
+        "TRAFFIC_AI_RATE_LIMIT_STREAM_REQUESTS",
+        "TRAFFIC_AI_TRUSTED_PROXY_HOPS",
+    )
+
+    def test_worker_passes_each_setting_with_an_overridable_default(self, services: dict) -> None:
+        env = services["worker"]["environment"]
+        for name in self.NAMES:
+            assert re.fullmatch(rf"\$\{{{name}:-[^}}]+\}}", env[name]), (
+                f"{name} must be `${{{name}:-default}}`, got {env[name]!r}"
+            )
+
+    def test_compose_defaults_equal_the_settings_defaults(
+        self, services: dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        resolved = _resolved_environment(services["worker"], LIMITER_ENV)
+        settings = _build_production_settings(monkeypatch, resolved)
+        for name in self.NAMES:
+            field = name.removeprefix("TRAFFIC_AI_").lower()
+            assert getattr(settings, field) == Settings.model_fields[field].default, field
+
+    def test_one_proxy_is_trusted_because_traefik_is_the_only_one(self, services: dict) -> None:
+        resolved = _resolved_environment(services["worker"], LIMITER_ENV)
+        assert resolved["TRAFFIC_AI_TRUSTED_PROXY_HOPS"] == "1"
+        proxies = [n for n, d in services.items() if "traefik" in str(d.get("image", ""))]
+        assert proxies == ["traefik"]
+
+    def test_overrides_from_the_environment_reach_settings(
+        self, services: dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env = {
+            **LIMITER_ENV,
+            "TRAFFIC_AI_RATE_LIMIT_ENABLED": "false",
+            "TRAFFIC_AI_RATE_LIMIT_REQUESTS": "30",
+            "TRAFFIC_AI_RATE_LIMIT_STREAM_REQUESTS": "3",
+            "TRAFFIC_AI_TRUSTED_PROXY_HOPS": "2",
+        }
+        settings = _build_production_settings(
+            monkeypatch, _resolved_environment(services["worker"], env)
+        )
+        assert settings.rate_limit_enabled is False
+        assert settings.rate_limit_requests == 30
+        assert settings.rate_limit_stream_requests == 3
+        assert settings.trusted_proxy_hops == 2
+
+    @pytest.mark.parametrize("service_name", ["worker", "migrate", "ui"])
+    def test_every_traffic_ai_variable_names_a_real_setting(
+        self, services: dict, service_name: str
+    ) -> None:
+        # A typo'd name is silently ignored by Settings (extra="ignore"), which would
+        # leave the default in force while the compose file claims otherwise.
+        for name in services[service_name]["environment"]:
+            if name.startswith("TRAFFIC_AI_"):
+                field = name.removeprefix("TRAFFIC_AI_").lower()
+                assert field in Settings.model_fields, f"{service_name}: {name} is not a setting"
+
+
+@pytest.mark.skipif(shutil.which("make") is None, reason="make is not installed")
+class TestMakefileClean:
+    """`make clean` used to run `down -v` and silently delete history and certificates."""
+
+    @staticmethod
+    def _make(*args: str) -> subprocess.CompletedProcess[str]:
+        make = shutil.which("make")
+        assert make is not None
+        # COMPOSE=echo on every call: even a recipe that did reach `down -v` would
+        # only print it. `make` is an absolute path from shutil.which and every
+        # argument is a literal, so S603 does not apply.
+        return subprocess.run(  # noqa: S603
+            [make, "-C", str(REPO_ROOT), "--no-print-directory", *args, "COMPOSE=echo"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+
+    def test_clean_keeps_the_volumes(self) -> None:
+        result = self._make("clean")
+        assert result.returncode == 0, result.stderr
+        assert "down" in result.stdout
+        assert "-v" not in result.stdout.split(), "clean must not remove volumes"
+        assert "--volumes" not in result.stdout
+
+    def test_clean_volumes_refuses_without_confirmation(self) -> None:
+        result = self._make("clean-volumes")
+        assert result.returncode != 0
+        assert "down -v" not in result.stdout, "the destructive command ran unconfirmed"
+        assert "CONFIRM=yes" in result.stdout
+
+    def test_clean_volumes_says_what_it_will_destroy(self) -> None:
+        output = self._make("clean-volumes").stdout
+        for volume in ("postgres-data", "letsencrypt"):
+            assert volume in output
+
+    @pytest.mark.parametrize("value", ["no", "y", "YES", "true", "1", ""])
+    def test_only_the_exact_word_yes_confirms(self, value: str) -> None:
+        result = self._make("clean-volumes", f"CONFIRM={value}")
+        assert result.returncode != 0
+        assert "down -v" not in result.stdout
+
+    def test_clean_volumes_proceeds_with_confirmation(self) -> None:
+        result = self._make("clean-volumes", "CONFIRM=yes")
+        assert result.returncode == 0, result.stderr
+        assert "down -v" in result.stdout
+
+    def test_down_dash_v_appears_only_under_clean_volumes(self) -> None:
+        recipe_lines = [
+            line
+            for line in MAKEFILE.read_text(encoding="utf-8").splitlines()
+            if line.startswith("\t") and re.search(r"down\s+(-v|--volumes)\b", line)
+        ]
+        assert recipe_lines == ["\t$(COMPOSE) down -v"]
+
+    def test_both_targets_are_declared_phony(self) -> None:
+        phony = re.search(r"^\.PHONY:(.*)$", MAKEFILE.read_text(encoding="utf-8"), re.MULTILINE)
+        assert phony is not None
+        assert {"clean", "clean-volumes"} <= set(phony.group(1).split())
+
+
+class TestWorkflows:
+    def test_every_third_party_action_is_pinned_to_a_commit_sha(self) -> None:
+        # A tag can be moved to different code; a commit SHA cannot. These jobs hold
+        # `packages: write`, so a mutable reference is a supply-chain hole.
+        sha_pinned = re.compile(r"^[\w.-]+/[\w./-]+@[0-9a-f]{40}$")
+        for path in (CI_WORKFLOW, RELEASE_WORKFLOW):
+            for step in _workflow_steps(_workflow(path)):
+                uses = step.get("uses")
+                if uses is None or uses.startswith("./"):
+                    continue
+                assert sha_pinned.match(uses), f"{path.name}: {uses!r} is not SHA-pinned"
+
+    def test_every_pinned_action_names_its_release_in_a_comment(self) -> None:
+        # The SHA alone is unreadable; the comment is how a human knows what to bump.
+        pattern = re.compile(r"uses:\s+\S+@[0-9a-f]{40}\s+#\s+v\d")
+        for path in (CI_WORKFLOW, RELEASE_WORKFLOW):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if "uses:" in line and "@" in line and not line.strip().startswith("#"):
+                    assert pattern.search(line), f"{path.name}: no version comment on {line!r}"
+
+    def test_ci_can_be_called_by_the_release_workflow(self) -> None:
+        assert "workflow_call" in _workflow_triggers(_workflow(CI_WORKFLOW))
+
+    def test_images_are_built_only_after_ci_passes(self) -> None:
+        # CI does not trigger on tag pushes, so `workflow_run` would never fire for a
+        # release; the reusable-workflow call is what puts CI in front of the images.
+        jobs = _workflow(RELEASE_WORKFLOW)["jobs"]
+        assert jobs["ci"]["uses"] == "./.github/workflows/ci.yml"
+        needs = jobs["images"]["needs"]
+        assert "ci" in ([needs] if isinstance(needs, str) else needs)
+        assert not any("if" in jobs[name] for name in ("ci", "images")), (
+            "a job-level `if` could let the images run when CI did not"
+        )
+
+    def test_ci_does_not_run_on_tags_itself(self) -> None:
+        # Pins the reason for the design above: if CI ever triggered on tags, the
+        # release would run it twice.
+        push = _workflow_triggers(_workflow(CI_WORKFLOW))["push"]
+        assert "tags" not in push
+
+    def test_the_called_workflow_needs_no_more_than_read_access(self) -> None:
+        jobs = _workflow(RELEASE_WORKFLOW)["jobs"]
+        assert jobs["ci"]["permissions"] == {"contents": "read"}
+        assert _workflow(CI_WORKFLOW)["permissions"] == {"contents": "read"}
+
+    def test_images_job_keeps_its_narrow_permissions(self) -> None:
+        permissions = _workflow(RELEASE_WORKFLOW)["jobs"]["images"]["permissions"]
+        assert permissions == {
+            "contents": "read",
+            "packages": "write",
+            "security-events": "write",
+        }
+
+    def test_latest_is_never_derived_for_a_pre_release_tag(self) -> None:
+        steps = _workflow_steps(_workflow(RELEASE_WORKFLOW))
+        (meta,) = [s for s in steps if s.get("id") == "meta"]
+        # The action's own heuristic is switched off; the rule lives in this file.
+        assert "latest=false" in meta["with"]["flavor"]
+        latest_lines = [
+            line.strip() for line in meta["with"]["tags"].splitlines() if "value=latest" in line
+        ]
+        assert len(latest_lines) == 1
+        (latest,) = latest_lines
+        assert "enable=" in latest, "`latest` must be conditional"
+        assert "github.ref_type == 'tag'" in latest, "a branch dispatch must not tag latest"
+        assert "!contains(github.ref_name, '-')" in latest, "a pre-release (v1.2.3-rc.1) must not"
+
+    def test_the_minor_alias_is_not_moved_by_a_pre_release_either(self) -> None:
+        steps = _workflow_steps(_workflow(RELEASE_WORKFLOW))
+        (meta,) = [s for s in steps if s.get("id") == "meta"]
+        (minor,) = [
+            line for line in meta["with"]["tags"].splitlines() if "{{major}}.{{minor}}" in line
+        ]
+        assert "!contains(github.ref_name, '-')" in minor
+
+    def test_full_version_and_sha_tags_are_still_produced(self) -> None:
+        steps = _workflow_steps(_workflow(RELEASE_WORKFLOW))
+        (meta,) = [s for s in steps if s.get("id") == "meta"]
+        tags = meta["with"]["tags"]
+        assert "type=semver,pattern={{version}}" in tags
+        assert "type=sha" in tags
+
+    def test_ci_postgres_matches_the_compose_postgres_image(self, services: dict) -> None:
+        ci_image = _workflow(CI_WORKFLOW)["jobs"]["test"]["services"]["postgres"]["image"]
+        assert ci_image == services["postgres"]["image"] == "postgres:17-alpine"
+
+
+class TestDocsAgreeWithTheCode:
+    def test_htpasswd_creation_commands_use_bcrypt_cost_12(self) -> None:
+        # htpasswd's default bcrypt cost is 5; every command that creates a hash must
+        # say -C 12, in the template, the runbooks, and the Helm values comments.
+        creating = re.compile(r"htpasswd\s+-nb?B\b")
+        for path in (HTPASSWD_EXAMPLE, DEPLOYMENT_DOC, KUBERNETES_DOC, *HELM_VALUES):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if creating.search(line):
+                    assert "-C 12" in line, f"{path.name}: htpasswd without -C 12: {line.strip()!r}"
+
+    def test_runbooks_do_not_pin_to_a_base_commit_plus_uncommitted_changes(self) -> None:
+        for path in (DEPLOYMENT_DOC, KUBERNETES_DOC):
+            text = path.read_text(encoding="utf-8")
+            assert "uncommitted" not in text, f"{path.name} still has the stale pin"
+            assert "base commit" not in text, f"{path.name} still has the stale pin"
+
+    def test_documented_history_signals_exist_in_the_code(self) -> None:
+        assert "history_events_lost_total" in render()[0].decode()
+        assert "history_events_lost" in ReadinessResponse.model_fields
+        for path in (DEPLOYMENT_DOC, KUBERNETES_DOC):
+            text = path.read_text(encoding="utf-8")
+            assert "history_events_lost_total" in text, path.name
+            assert "history_events_lost" in text, path.name
+
+    def test_documented_proxy_hops_setting_exists_and_is_documented(self) -> None:
+        assert "trusted_proxy_hops" in Settings.model_fields
+        for path in (DEPLOYMENT_DOC, KUBERNETES_DOC):
+            assert "TRAFFIC_AI_TRUSTED_PROXY_HOPS" in path.read_text(encoding="utf-8"), path.name
+
+    @pytest.mark.parametrize(
+        ("path", "gap"),
+        [
+            (DEPLOYMENT_DOC, "docker-socket-proxy"),
+            (DEPLOYMENT_DOC, "event loop"),
+            (KUBERNETES_DOC, "last-applied-configuration"),
+            (KUBERNETES_DOC, "event loop"),
+        ],
+        ids=lambda v: v.name if isinstance(v, Path) else v,
+    )
+    def test_known_gaps_are_named_in_the_runbooks(self, path: Path, gap: str) -> None:
+        text = path.read_text(encoding="utf-8")
+        assert "Known gaps" in text, f"{path.name} has no Known gaps section"
+        assert gap in text, f"{path.name} does not name the gap: {gap}"

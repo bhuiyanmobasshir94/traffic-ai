@@ -28,6 +28,11 @@ data:
   TRAFFIC_AI_FRAME_WIDTH: {{ .Values.worker.env.frameWidth | quote }}
   TRAFFIC_AI_METRICS_ENABLED: {{ .Values.worker.env.metricsEnabled | quote }}
   TRAFFIC_AI_RATE_LIMIT_ENABLED: {{ .Values.worker.env.rateLimitEnabled | quote }}
+  TRAFFIC_AI_RATE_LIMIT_REQUESTS: {{ .Values.worker.env.rateLimitRequests | quote }}
+  TRAFFIC_AI_RATE_LIMIT_STREAM_REQUESTS: {{ .Values.worker.env.rateLimitStreamRequests | quote }}
+  # Reverse proxies between the client and this pod (see values.yaml). The
+  # worker uses it to find the real client address for rate limiting.
+  TRAFFIC_AI_TRUSTED_PROXY_HOPS: {{ .Values.worker.env.trustedProxyHops | quote }}
   TRAFFIC_AI_ALLOW_UNAUTHENTICATED: {{ .Values.auth.allowUnauthenticated | quote }}
   # Both libraries write caches/config on first use and the root filesystem
   # is read-only, so both are pointed at the writable /app/weights volume.

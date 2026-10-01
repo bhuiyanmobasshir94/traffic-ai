@@ -1,9 +1,15 @@
 name: CI
 
+# Third-party actions are pinned to a commit SHA with the release in a comment
+# (a tag can be moved; a SHA cannot). See the note in release.yml.
+
 on:
   push:
     branches: [main]
   pull_request:
+  # Lets release.yml run exactly this suite on a tag's commit and publish images
+  # only if it passes. CI does not run on tag pushes by itself.
+  workflow_call:
 
 # Nothing here writes to the repository, a registry, or the security tab, and
 # no job needs a secret. Jobs inherit read-only access; widen per job if one
@@ -28,9 +34,9 @@ jobs:
   lockfile:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: ${{ env.UV_VERSION }}
 
@@ -40,9 +46,9 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: ${{ env.UV_VERSION }}
           python-version: ${{ env.PYTHON_VERSION }}
@@ -67,9 +73,11 @@ jobs:
     # test (tests/db/test_repository.py), which is only safe against a database
     # that exists for this job alone. These credentials guard nothing: the
     # container is unreachable from outside the runner and dies with the job.
+    # Same major and variant as compose.yaml's postgres, so the migrations are
+    # proven against the server version that actually ships.
     services:
       postgres:
-        image: postgres:16
+        image: postgres:17-alpine
         env:
           POSTGRES_USER: traffic
           POSTGRES_PASSWORD: traffic-ci-only
@@ -86,9 +94,9 @@ jobs:
       TRAFFIC_AI_TEST_DATABASE_URL: postgresql+asyncpg://traffic:traffic-ci-only@localhost:5432/traffic_test
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: ${{ env.UV_VERSION }}
           python-version: ${{ env.PYTHON_VERSION }}
@@ -127,9 +135,9 @@ jobs:
   pip-install:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
@@ -146,7 +154,7 @@ jobs:
       DOMAIN: traffic.example.org
       ACME_EMAIL: ops@traffic.example.org
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Validate compose.yaml
         run: |
@@ -159,7 +167,7 @@ jobs:
   helm-lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Lint Helm charts
         run: |

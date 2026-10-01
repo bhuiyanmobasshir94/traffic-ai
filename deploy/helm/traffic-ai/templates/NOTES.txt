@@ -12,6 +12,49 @@ Ingress is disabled. Reach the services from inside the cluster, or:
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "traffic-ai.ui.fullname" . }} {{ .Values.ui.service.port }}
 {{- end }}
 
+{{- if and .Values.ingress.enabled .Values.ingress.edgeAuth.enabled }}
+
+EDGE LOGIN: the ingress asks for a username and password (HTTP BasicAuth) before
+it serves anything on this host, /api included. That means /api/healthz is behind
+the login too when reached through the ingress: an external uptime check must send
+BasicAuth credentials (curl -u USER). The kubelet's own probes go straight to the
+pod and are not affected.
+{{- if eq (default "" .Values.ingress.className) "traefik" }}
+The login only works once the Middleware CRs named in ingress.traefik.middlewares
+(<namespace>-<name>@kubernetescrd) exist; this chart does not create them (see
+docs/KUBERNETES.md, "Edge authentication"). Until they do, expect Traefik to reject
+the route; its log names the missing Middleware.
+{{- else }}
+With ingress-nginx the login gates the dashboard, but the browser's direct /api
+requests (the live video) reach the worker with the BasicAuth header and get 401.
+See docs/KUBERNETES.md, "Edge authentication", for the options.
+{{- end }}
+{{- end }}
+
+{{- if .Values.migrations.enabled }}
+
+MIGRATIONS: `alembic upgrade head` ran as the Helm hook Job
+"{{ include "traffic-ai.migrate.fullname" . }}" before this release was applied, and runs again before
+every upgrade. A failed migration fails the release and leaves the running pods
+alone; a failed Job is kept for its logs:
+  kubectl -n {{ .Release.Namespace }} logs job/{{ include "traffic-ai.migrate.fullname" . }}
+{{- else }}
+
+WARNING: migrations.enabled is false. Nothing creates or updates the database
+schema, so history is unavailable until you run `alembic upgrade head` yourself.
+{{- end }}
+
+WORKER REPLICAS: keep worker.replicaCount at 1 (it is {{ .Values.worker.replicaCount }}). Every worker replica
+runs every camera pipeline and writes its own copy of each crossing, so more than
+one duplicates history. The worker is never autoscaled and rolls out with
+strategy Recreate (a short gap while the old pod stops and the new one starts).
+{{- if ne (int .Values.worker.replicaCount) 1 }}
+
+WARNING: worker.replicaCount is {{ .Values.worker.replicaCount }}. Each crossing is being written to
+Postgres {{ .Values.worker.replicaCount }} times, and the replicas overwrite each other's live counters.
+Set worker.replicaCount=1.
+{{- end }}
+
 {{- if and (not .Values.auth.existingSecret) (not .Values.auth.apiToken) (not .Values.auth.allowUnauthenticated) }}
 
 WARNING: no API token is configured. The worker runs with
@@ -27,6 +70,11 @@ Create a Secret and reference it:
 
 WARNING: credentials were supplied through chart values, not an existing
 Secret. Values files get committed and shared; prefer auth.existingSecret.
+{{- if .Values.migrations.enabled }}
+The generated Secret is a Helm hook object (so the migration Job can read it), which
+means `helm uninstall` leaves it behind: delete it yourself
+(kubectl -n {{ .Release.Namespace }} delete secret {{ include "traffic-ai.fullname" . }}).
+{{- end }}
 {{- end }}
 
 {{- if not .Values.ingress.tls.enabled }}

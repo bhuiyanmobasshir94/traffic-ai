@@ -43,7 +43,15 @@ auth:
 
 ingress:
   enabled: true
-  className: nginx
+  # Traefik, because it is the only controller where the whole edge login works:
+  # BasicAuth at the edge, then the API bearer injected toward the worker, so the
+  # browser's direct /api requests (the live MJPEG video) are authenticated.
+  # ingress-nginx cannot inject the token (it forwards the browser's Basic
+  # header, which the worker rejects with 401), so under nginx the dashboard is
+  # gated but the video does not play. nginx stays a supported choice with that
+  # limit: see "Using ingress-nginx instead" below and docs/KUBERNETES.md,
+  # "Edge authentication".
+  className: traefik
   # Deliberately empty: the chart refuses to render without a real host, so a
   # forgotten --set ingress.host fails loudly instead of deploying a
   # placeholder name.
@@ -53,36 +61,61 @@ ingress:
     # Pre-created kubernetes.io/tls Secret, or one your certificate manager
     # populates. This chart does not install cert-manager or its CRDs.
     secretName: traffic-ai-tls
-  # Edge BasicAuth, the Kubernetes counterpart of compose.yaml's Traefik login.
-  # Create the Secret first (htpasswd lines under the key `auth`):
-  #
-  #   kubectl -n traffic-ai create secret generic traffic-ai-basic-auth \
-  #     --from-file=auth=<(htpasswd -nbB admin '<password>')
-  #
-  # KNOWN LIMIT with ingress-nginx, which this overlay targets: it gates the
-  # dashboard, but it cannot inject the API token toward the worker, so the
-  # browser's direct /api requests (the live MJPEG video) reach the worker with
-  # the BasicAuth header and get 401. Pick one before going live, in
-  # docs/KUBERNETES.md, "Edge authentication": run Traefik as the ingress
-  # (className: traefik + traefik.middlewares), or front /api with a forward-auth
-  # proxy that injects the header, or accept an edge-only /api
-  # (auth.allowUnauthenticated: true plus the NetworkPolicy below).
   edgeAuth:
     enabled: true
+    # ingress-nginx only (see below); Traefik takes its users from the Middleware.
     secretName: traffic-ai-basic-auth
-  annotations:
-    nginx.ingress.kubernetes.io/ssl-redirect: "true"
-    # Streamlit holds a WebSocket (/_stcore/stream) open and the worker serves
-    # long-lived MJPEG streams; the controller's 60s default timeouts would
-    # cut both. Buffering off so frames reach the browser as they are produced.
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+  # The Middleware CRs below are NOT created by this chart: you create them in
+  # the release namespace first, with exactly these names (the format is
+  # <namespace>-<name>@kubernetescrd, and the namespace here is `traffic-ai`).
+  # YAML for all three, and the Secret each needs, is in docs/KUBERNETES.md,
+  # "Edge authentication". ORDER MATTERS, as in compose.yaml:
+  #   1. ratelimit : throttle login guesses before they are checked
+  #   2. basicauth : the human login
+  #   3. api-bearer: replace the browser's Basic header with the API token, so
+  #                  the video request reaches the worker authenticated
+  # A name that does not exist as a Middleware is expected to make Traefik
+  # reject the route rather than serve the app unprotected (UNVERIFIED: no live
+  # Traefik was available). Create all three before installing.
+  traefik:
+    middlewares:
+      - traffic-ai-ratelimit@kubernetescrd
+      - traffic-ai-basicauth@kubernetescrd
+      - traffic-ai-api-bearer@kubernetescrd
+  # No controller-specific annotations are set for Traefik. UNVERIFIED: that
+  # Traefik's default entrypoint timeouts leave the Streamlit WebSocket and the
+  # long-lived MJPEG streams alone was not checked against a live controller; if
+  # either is cut off, tune `respondingTimeouts` on Traefik's entrypoint (its
+  # own configuration, not this chart's).
+  annotations: {}
+  #
+  # --- Using ingress-nginx instead ---------------------------------------
+  # Replace the `className`, `edgeAuth` and `annotations` choices above, with
+  # `--set ingress.className=nginx` plus these annotations, and create the
+  # BasicAuth Secret first (htpasswd lines under the key `auth`):
+  #
+  #   kubectl -n traffic-ai create secret generic traffic-ai-basic-auth \
+  #     --from-file=auth=<(htpasswd -nbB -C 12 admin '<password>')
+  #
+  #   annotations:
+  #     nginx.ingress.kubernetes.io/ssl-redirect: "true"
+  #     # Streamlit holds a WebSocket (/_stcore/stream) open and the worker serves
+  #     # long-lived MJPEG streams; the controller's 60s default timeouts would
+  #     # cut both. Buffering off so frames reach the browser as produced.
+  #     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+  #     nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+  #     nginx.ingress.kubernetes.io/proxy-buffering: "off"
+  #
+  # and point `networkPolicy` at ingress-nginx's namespace and pods (below).
+  # KNOWN LIMIT: the dashboard is gated, but the browser's direct /api requests
+  # get 401, so the video does not play, until you take one of the options in
+  # docs/KUBERNETES.md, "Edge authentication".
 
 worker:
-  # One replica on purpose. Each worker replica runs every camera pipeline
-  # and publishes to the same Redis keys, so a second replica doubles the CPU
-  # bill without adding capacity — it is redundancy, not scale-out.
+  # One replica, always. Each worker replica runs every camera pipeline and
+  # writes its own copy of every crossing, so a second replica duplicates
+  # history and overwrites the live counters: it is not scale-out and not safe
+  # redundancy. (The chart also never autoscales the worker.)
   replicaCount: 1
 
 ui:
@@ -95,11 +128,15 @@ podDisruptionBudget:
   enabled: true
   maxUnavailable: 1
 
-# Default-deny ingress to the worker. Check the selectors match your ingress
-# controller (these are ingress-nginx's) and that your CNI enforces policy.
+# Default-deny ingress to the worker. These selectors are TRAEFIK's, matching
+# `ingress.className: traefik` above: the policy admits only the UI pods and the
+# pods these selectors match, so a Traefik that runs elsewhere or is labelled
+# differently is locked out of /api. Check both against your install
+# (`kubectl get pods -A -l app.kubernetes.io/name=traefik`), and that your CNI
+# enforces NetworkPolicy. For ingress-nginx use `ingress-nginx` in both.
 networkPolicy:
   enabled: true
   ingressControllerNamespaceSelector:
-    kubernetes.io/metadata.name: ingress-nginx
+    kubernetes.io/metadata.name: traefik
   ingressControllerPodSelector:
-    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/name: traefik

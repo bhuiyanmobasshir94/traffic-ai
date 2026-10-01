@@ -13,6 +13,10 @@
 # one. The browser therefore authenticates with BasicAuth alone and never sees
 # the token.
 #
+# BasicAuth has no lockout of its own, so each router also carries a Traefik
+# `ratelimit` middleware that runs BEFORE it: password guessing is answered
+# 429 instead of being tried at wire speed. See the notes on the worker router.
+#
 # Startup order: postgres healthy -> migrate (one-shot `alembic upgrade head`)
 # -> worker (also needs redis healthy) -> ui.
 #
@@ -198,6 +202,13 @@ services:
   worker:
     <<: *worker-image
     restart: unless-stopped
+    # Docker's default is 10s, then SIGKILL. The worker's shutdown (api/app.py
+    # lifespan) waits up to 10s for the pipelines to stop and then up to 10s for
+    # the history writer to drain its buffer to Postgres, and uvicorn first
+    # drains open requests (the app caps that at 5s): 25s worst case. 30s covers
+    # it, so a `docker compose stop` or a redeploy does not cut the final
+    # history flush short.
+    stop_grace_period: 30s
     depends_on:
       redis:
         condition: service_healthy
@@ -220,6 +231,18 @@ services:
       # On by default. Off keeps the live dashboard and drops history; the
       # migrate service still runs, since the schema is cheap to keep current.
       TRAFFIC_AI_PERSISTENCE_ENABLED: ${TRAFFIC_AI_PERSISTENCE_ENABLED:-true}
+      # The worker's own per-client limiter (the edge limiter in the labels below
+      # is a separate, earlier layer). Defaults are Settings' own, repeated here
+      # so they are visible and tunable from .env.
+      TRAFFIC_AI_RATE_LIMIT_ENABLED: ${TRAFFIC_AI_RATE_LIMIT_ENABLED:-true}
+      TRAFFIC_AI_RATE_LIMIT_REQUESTS: ${TRAFFIC_AI_RATE_LIMIT_REQUESTS:-120}
+      TRAFFIC_AI_RATE_LIMIT_STREAM_REQUESTS: ${TRAFFIC_AI_RATE_LIMIT_STREAM_REQUESTS:-10}
+      # How many reverse proxies sit between the client and the worker, so the
+      # limiter keys on the real client address instead of the proxy's. 1 is
+      # Traefik alone, as shipped here. Put another proxy or a load balancer in
+      # front of Traefik and this must grow with it, or every client shares the
+      # proxy's bucket (see docs/DEPLOYMENT.md, "Rate limits and proxy hops").
+      TRAFFIC_AI_TRUSTED_PROXY_HOPS: ${TRAFFIC_AI_TRUSTED_PROXY_HOPS:-1}
       TRAFFIC_AI_VIDEO_DIR: /data/videos
       TRAFFIC_AI_MODEL_WEIGHTS: ${TRAFFIC_AI_MODEL_WEIGHTS:-/app/weights/yolov8n.pt}
       TRAFFIC_AI_DEVICE: ${TRAFFIC_AI_DEVICE:-cpu}
@@ -259,13 +282,16 @@ services:
       # Explicit and higher than the ui router's — PathPrefix(/api) must win
       # over the catch-all Host() rule regardless of rule-length ordering.
       - traefik.http.routers.worker.priority=100
-      # ORDER MATTERS: Traefik runs these left to right. worker-basicauth
-      # first, so nothing reaches the token step without a valid login;
-      # api-bearer second, so the Authorization header the browser sent
-      # (Basic ...) is replaced by the service token only for a request that
-      # has already passed. Reversed, the login check would run against a
-      # header the token step had already overwritten.
-      - traefik.http.routers.worker.middlewares=worker-basicauth@docker,api-bearer@docker
+      # ORDER MATTERS: Traefik runs these left to right. worker-ratelimit
+      # first, so a flood of login attempts is refused (429) before BasicAuth
+      # spends a bcrypt check on each one; worker-basicauth second, so nothing
+      # reaches the token step without a valid login; api-bearer last, so the
+      # Authorization header the browser sent (Basic ...) is replaced by the
+      # service token only for a request that has already passed. Reversed,
+      # the login check would run against a header the token step had already
+      # overwritten, and a limiter after BasicAuth would never see the
+      # failed guesses it exists to slow down.
+      - traefik.http.routers.worker.middlewares=worker-ratelimit@docker,worker-basicauth@docker,api-bearer@docker
       - traefik.http.services.worker.loadbalancer.server.port=8000
       # --- middleware definitions -----------------------------------------
       # Each router owns its BasicAuth middleware, defined in its own
@@ -279,6 +305,22 @@ services:
       - traefik.http.middlewares.worker-basicauth.basicauth.realm=Traffic AI
       # Do not forward the browser's Basic credentials to the upstream.
       - traefik.http.middlewares.worker-basicauth.basicauth.removeheader=true
+      # Edge rate limit, per source address: 20 requests/second sustained, with
+      # a burst allowance of 40. BasicAuth has no lockout, so this is what
+      # makes online password guessing slow; it also caps a single noisy client.
+      # The figures are estimates, not measurements: raise `burst` if legitimate
+      # users see 429s. Over the limit, Traefik answers 429 and the request
+      # never reaches BasicAuth or the worker.
+      - traefik.http.middlewares.worker-ratelimit.ratelimit.average=20
+      - traefik.http.middlewares.worker-ratelimit.ratelimit.burst=40
+      # The bucket key is the TCP peer address (depth 0 = ignore
+      # X-Forwarded-For), which is the real client because Traefik is the edge
+      # here. Behind a load balancer that is WRONG — every client would share the
+      # balancer's bucket — so set depth to the number of trusted proxies
+      # in front of Traefik (and see docs/DEPLOYMENT.md, "Rate limits and proxy
+      # hops"). A depth that does not match the real number of proxies keys
+      # the bucket on the wrong address.
+      - traefik.http.middlewares.worker-ratelimit.ratelimit.sourcecriterion.ipstrategy.depth=0
       # Sets the bearer the worker's AuthMiddleware expects. The token is
       # interpolated from the environment, never written in this file. It does
       # become part of the container's labels, readable by anyone who can run
@@ -294,6 +336,9 @@ services:
       context: .
       dockerfile: docker/Dockerfile.ui
     restart: unless-stopped
+    # Streamlit has no history to flush; this only has to outlast open
+    # WebSocket sessions closing. Docker's 10s default is close, 15s is margin.
+    stop_grace_period: 15s
     depends_on:
       worker:
         condition: service_healthy
@@ -346,10 +391,18 @@ services:
       - traefik.http.routers.ui.entrypoints=websecure
       - traefik.http.routers.ui.tls.certresolver=le
       - traefik.http.routers.ui.priority=1
-      # Headers first, so the 401 login challenge carries them too (HSTS on the
-      # very first response is the useful one); then BasicAuth.
-      - traefik.http.routers.ui.middlewares=ui-security-headers@docker,ui-basicauth@docker
+      # Headers first, so the 401 login challenge and a 429 carry them too (HSTS
+      # on the very first response is the useful one); then the rate limit, so
+      # guesses are throttled before BasicAuth checks them; then BasicAuth.
+      - traefik.http.routers.ui.middlewares=ui-security-headers@docker,ui-ratelimit@docker,ui-basicauth@docker
       - traefik.http.services.ui.loadbalancer.server.port=8501
+      # --- rate limit -------------------------------------------------------
+      # Own bucket, defined here rather than shared with the worker router (the
+      # same reason as the BasicAuth middleware below). Same figures and the same
+      # depth caveat; see the notes on the worker router.
+      - traefik.http.middlewares.ui-ratelimit.ratelimit.average=20
+      - traefik.http.middlewares.ui-ratelimit.ratelimit.burst=40
+      - traefik.http.middlewares.ui-ratelimit.ratelimit.sourcecriterion.ipstrategy.depth=0
       # --- BasicAuth ------------------------------------------------------
       # Same users file as the worker router; defined here, not shared — see
       # the note on the worker's middleware definitions.

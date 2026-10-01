@@ -13,7 +13,7 @@ truth for topology; `CLAUDE.md` says what is and is not real in this codebase.
              +----v----+   BasicAuth on BOTH routers (users file you create)
              | traefik |   /api: after login, Authorization is replaced with
              +----+----+         "Bearer <TRAFFIC_AI_API_TOKEN>"
-        /api |         | /
+        /api |         | /        (a rate limit runs BEFORE the login on both)
       +------v---+  +--v-----+
       |  worker  |<-|   ui   |  the UI calls the worker directly, with the token
       +--+----+--+  +--------+
@@ -23,10 +23,10 @@ truth for topology; `CLAUDE.md` says what is and is not real in this codebase.
    +-------+ +----------+
 ```
 
-Verified against branch `production-hardening`, base commit `5c67d11` plus
-uncommitted working-tree changes, on 2026-10-01. See "What is and is not
-verified" at the end: no Docker daemon was available, so nothing below was run
-against a live stack.
+Verified against this branch (`production-hardening`) on 2026-10-01. See "What
+is and is not verified" at the end: no Docker daemon was available, so nothing
+below was run against a live stack. "Known gaps" lists what this design does not
+solve.
 
 ## Prerequisites
 
@@ -90,6 +90,10 @@ closed on purpose:
 | `TRAFFIC_AI_MODEL_WEIGHTS` | `/app/weights/yolov8n.pt` | |
 | `TRAFFIC_AI_LOG_LEVEL` | `INFO` | |
 | `TRAFFIC_AI_LOG_FORMAT` | `json` | |
+| `TRAFFIC_AI_RATE_LIMIT_ENABLED` | `true` | The worker's own per-client limiter (not the Traefik one; see "Rate limits and proxy hops") |
+| `TRAFFIC_AI_RATE_LIMIT_REQUESTS` | `120` | Ordinary requests allowed per client address per 60-second window |
+| `TRAFFIC_AI_RATE_LIMIT_STREAM_REQUESTS` | `10` | MJPEG stream requests per client address per window |
+| `TRAFFIC_AI_TRUSTED_PROXY_HOPS` | `1` | Reverse proxies in front of the worker. `1` is Traefik alone; change it only if you add another proxy or a load balancer in front. See "Rate limits and proxy hops" |
 | `TRAEFIK_LOG_LEVEL` | `INFO` | |
 
 **Not in `.env`, but required files:**
@@ -136,15 +140,33 @@ closed on purpose:
    create an empty directory in its place.
 
    ```bash
-   htpasswd -nbB admin '<password>' > config/traefik/users.htpasswd
+   htpasswd -nbB -C 12 admin '<password>' > config/traefik/users.htpasswd
    # more users: use >> so the first is kept
-   htpasswd -nbB second-user '<password>' >> config/traefik/users.htpasswd
+   htpasswd -nbB -C 12 second-user '<password>' >> config/traefik/users.htpasswd
    chmod 600 config/traefik/users.htpasswd
    ```
 
-   No `htpasswd`? `docker run --rm httpd:2 htpasswd -nbB admin '<password>' >
+   `-B` is bcrypt and **`-C 12` is its cost**: `htpasswd` defaults to 5, which is
+   far cheaper for an attacker to brute-force. Use a long random password per
+   person (for example `openssl rand -base64 18`), never one reused from
+   elsewhere: this login is the only thing between the internet and the dashboard
+   and the live video, and Traefik's rate limit (see "Rate limits and proxy
+   hops") slows guessing without preventing it.
+
+   **The cost is paid in CPU, and the browser sends the credentials with every
+   request.** Hashing one password at cost 12 took about 0.3 s of CPU on the
+   developer laptop this was written on (cost 10: about 0.08 s; cost 5: about
+   0.01 s; measured with `htpasswd`, not on a server). If Traefik re-checks the
+   hash on each request, which was **not observed here** (no Docker daemon), a page
+   that loads dozens of assets spends that much CPU on each one, against the 0.5
+   CPU limit `compose.yaml` gives Traefik. After the first deploy, watch
+   `docker stats traefik` while loading the dashboard. If it is pinned or the page
+   loads slowly, regenerate the file with `-C 10` rather than going back to the
+   default of 5.
+
+   No `htpasswd`? `docker run --rm httpd:2 htpasswd -nbB -C 12 admin '<password>' >
    config/traefik/users.htpasswd`. A password typed on the command line is in your
-   shell history; use `htpasswd -nB admin` and type it at the prompt instead.
+   shell history; use `htpasswd -nB -C 12 admin` and type it at the prompt instead.
    `config/traefik/users.htpasswd.example` is a comment-only template. The file
    lives on the host, not in a Compose label, because a bcrypt hash is full of `$`
    characters that Compose would try to interpolate.
@@ -219,10 +241,19 @@ curl -sS  -u admin https://$DOMAIN/api/readyz
 `/api/readyz` answers 200 only when Redis responds **and** at least one camera
 pipeline is RUNNING, and 503 otherwise, with a `detail` of `redis unreachable` or
 `no camera pipeline running`. 503 is expected for the first minutes while model
-weights download. The body also carries `database`: `true`/`false` for Postgres,
-or `null` when persistence is off. The database is reported but never gates
-readiness: with Postgres down the dashboard keeps serving live counts and video
-and only history is lost.
+weights download. The body also carries two fields that are reported but never
+gate readiness: with Postgres down the dashboard keeps serving live counts and
+video and only history is lost.
+
+- `database`: `true` when Postgres answered **and** has the history table,
+  `false` when it is unreachable or reachable but not migrated (the usual cause is
+  a skipped `migrate`), and `null` when persistence is off.
+- `history_events_lost`: how many crossings were counted live but will never reach
+  Postgres since the worker started (the in-memory buffer overflowed during a
+  database outage, or the database refused a batch). It is `null`, **not** `0`,
+  when there is no history writer to ask (persistence off, or its setup failed). A
+  number above zero means the history totals are short by at least that much; the
+  live dashboard is unaffected. The counter resets when the worker restarts.
 
 ```bash
 # 3. Metrics. Through the edge, Traefik supplies the bearer for you.
@@ -231,8 +262,23 @@ curl -fsS -u admin https://$DOMAIN/api/metrics | head
 
 The series are `http_requests_total`, `http_request_duration_seconds`,
 `pipeline_frames_processed_total`, `pipeline_fps`, `pipeline_active_tracks`,
-`pipeline_status`, and `crossings_total` (`traffic_ai/metrics.py`). `/api/metrics`
-is under the API token like every other `/api` route except the two probes.
+`pipeline_status`, `crossings_total`, and `history_events_lost_total`
+(`traffic_ai/metrics.py`). `/api/metrics` is under the API token like every other
+`/api` route except the two probes.
+
+`history_events_lost_total{reason}` counts crossings that were counted live but
+never persisted, by reason: `buffer_full` (evicted from the in-memory buffer during
+a database outage) or `flush_failed` (a batch the database refused). History is
+best-effort by design, so the loss itself is the thing to alert on. Both series
+exist at 0 from the first scrape, so this works from the start:
+
+```
+increase(history_events_lost_total[15m]) > 0
+```
+
+(`/api/readyz` and the Analytics page show the same total; see the
+`history_events_lost` field above.) The alert expression is standard PromQL and
+was **not run** against a Prometheus.
 
 To check the **worker's own** token enforcement, which the edge otherwise hides,
 go around Traefik, from inside the container (the token is read from its
@@ -276,9 +322,9 @@ A successful issuance logs something like `Certificates obtained for domains
 certificate chain ending in a Let's Encrypt intermediate (`R-something` under ISRG
 Root X1) with a `not before` timestamp from just now. Certificates are stored in
 the `letsencrypt` named volume (`/letsencrypt/acme.json` inside the traefik
-container) and persist across restarts and `make down`; only `make clean` (which
-removes volumes) or deleting that volume forces re-issuance. If the certificate
-never appears, see Troubleshooting.
+container) and persist across restarts, `make down` and `make clean`; only
+`make clean-volumes CONFIRM=yes` or deleting that volume by hand forces
+re-issuance. If the certificate never appears, see Troubleshooting.
 
 ## Logs
 
@@ -376,8 +422,11 @@ a code rollback. If a bad release corrupted state in Redis,
 `docker compose restart redis` clears it immediately: Redis runs with no
 persistence (`--save "" --appendonly no`), so a restart is a full, safe reset, and
 the dashboard reports stale until the worker repopulates it. `make down` stops
-everything without deleting volumes; **`make clean` removes them, Postgres history
-included.**
+everything without deleting volumes, and `make clean` is the same thing (it used to
+delete them; it no longer does). **`make clean-volumes` removes them, Postgres
+history and the issued certificate included.** It prints what it will destroy and
+refuses to run unless you pass `CONFIRM=yes` (`make clean-volumes CONFIRM=yes`);
+take a dump first (see "Backups and restore").
 
 ## Metrics: scraping with Prometheus
 
@@ -416,9 +465,76 @@ scrape_configs:
 
 Put the token or password in a file readable only by Prometheus, not in the YAML.
 Both snippets are standard Prometheus configuration and were **not run** against
-this stack. The in-process rate limiter counts per client address (the first
-`X-Forwarded-For` entry behind Traefik), so a scraper polling every 15 seconds is
-well under the default 120 requests per minute.
+this stack. The worker's in-process rate limiter does not count requests that
+present the valid API token or that hit the two probe paths
+(`src/traffic_ai/api/middleware.py`), so a scraper is not throttled by it on either
+route; see "Rate limits and proxy hops".
+
+## Rate limits and proxy hops
+
+Two limiters, in two places, for two different jobs.
+
+**At the edge, in Traefik (`compose.yaml` labels).** Each router (`worker`, `ui`)
+has its own `ratelimit` middleware that runs **before** BasicAuth: 20 requests per
+second sustained, with a burst allowance of 40, per source address. BasicAuth has
+no lockout, so without this a login can be guessed at wire speed; with it, excess
+requests are answered `429` and never reach the password check or the worker. The
+figures are estimates, not measurements. A dashboard page load fetches a burst of
+static assets, so if legitimate users see `429` (for example many people behind
+one office address), raise `burst` in the labels of both services in
+`compose.yaml` and run `docker compose up -d` (Compose recreates the services whose
+labels changed). The two routers have separate buckets.
+
+The bucket key is the **TCP peer address** (`ipstrategy.depth=0`, which ignores
+`X-Forwarded-For`). That is correct while Traefik is the edge, as shipped. Put a
+load balancer or another proxy in front of Traefik and every client would arrive
+from the balancer's address and share one bucket, so set `depth` on both
+`ratelimit` middlewares to the number of trusted proxies in front of Traefik (and
+make Traefik trust that proxy's forwarded headers, which is Traefik configuration
+this stack does not set). Not exercised here: see the unverified list.
+
+**In the worker (`TRAFFIC_AI_RATE_LIMIT_*`).** The API's own per-client limiter:
+`TRAFFIC_AI_RATE_LIMIT_REQUESTS` ordinary requests and
+`TRAFFIC_AI_RATE_LIMIT_STREAM_REQUESTS` MJPEG stream requests per client address per
+60-second window, switchable with `TRAFFIC_AI_RATE_LIMIT_ENABLED`. It does not count
+the two probe paths, and it does not count ordinary requests that carry the valid
+API token (the UI's server-to-server calls, and anything Traefik injected the bearer
+into); a wrong or missing token is still counted. The stream budget applies even to
+token holders. Read from `src/traffic_ai/api/middleware.py`.
+
+**`TRAFFIC_AI_TRUSTED_PROXY_HOPS`** tells that limiter how many reverse proxies sit
+between the client and the worker, so it can find the real client address in
+`X-Forwarded-For` (each proxy appends the address it received the request from, so
+the client is the entry that many places from the **right**; anything further left
+was written by the caller and is not believed). The default `1` is this stack
+(Traefik only). Set it to the true number if you add a proxy or load balancer in
+front; **too low** and clients share the proxy's bucket, **too high** and the entry
+it picks is not a proxy-supplied one. `0` ignores the header and uses the socket
+peer, the right value if the worker were ever reachable without a proxy. The limiter
+falls back to the socket peer, never to a header value, when the header is absent,
+has fewer entries than the hop count, or the chosen entry is not an IP address. That
+rule is from the code (`RateLimitMiddleware.client_key`); it was not exercised
+against a live proxy chain.
+
+## Graceful shutdown
+
+`docker compose stop`, `down`, and a redeploy send `SIGTERM` and then `SIGKILL` after
+the service's `stop_grace_period`. Docker's default is 10 seconds.
+
+- **worker: `30s`.** Its shutdown is bounded by the code: uvicorn first waits up to 5
+  seconds for open requests (`GRACEFUL_SHUTDOWN_SECONDS` in `api/__main__.py`; open
+  MJPEG streams are told to end), then the lifespan waits up to 10 seconds for the
+  camera pipelines to stop and up to 10 more for the history writer to flush its
+  buffered crossings to Postgres (`_SHUTDOWN_TIMEOUT_SECONDS` in `api/app.py`): 25
+  seconds worst case, so 30 leaves margin. With the Docker default the final flush
+  could be cut off and those crossings lost. (`tests/test_deployment_config.py`
+  checks the grace period against those constants.)
+- **ui: `15s`.** Streamlit has nothing to flush; this only gives open sessions time
+  to close.
+
+If the worker is killed anyway (the host loses power, `docker kill`), the crossings
+still in its buffer are lost with it. That is the same loss `history_events_lost`
+reports for the failures it can observe; it cannot observe a hard kill.
 
 ## Resource expectations
 
@@ -482,6 +598,12 @@ Local connections inside the container are typically trusted, so this works even
 though the old password no longer matches. Then `make up`. If there is nothing
 worth keeping, you can instead remove the volume and let it re-initialise
 (`docker compose down`, `docker volume rm <project>_postgres-data`, `make up`).
+
+**`429 Too Many Requests` from the edge.** The Traefik rate limit (20 requests/s,
+burst 40, per source address; see "Rate limits and proxy hops"). Expected after a run
+of wrong passwords or a flood. If legitimate users hit it, the usual cause is many of
+them sharing one address (an office NAT, or a load balancer in front of Traefik that
+makes every client look like one), not a limit that is too small.
 
 **Login prompt loops, or `401` after entering the right password.** Check the
 users file: one `user:$2y$...` line per user, no blank-looking trailing spaces, no
@@ -593,14 +715,20 @@ authenticated form was not re-run.
   the dashboard. SAMEORIGIN rather than DENY because Streamlit components, including
   the map, render in same-origin iframes. The worker sets its own, stricter headers
   on `/api` responses.
-- The rate limiter is per process and per client address; it slows a casual
-  scraper and is not a hard quota.
+- **BasicAuth is rate-limited and has no lockout.** Traefik answers `429` to a source
+  that exceeds 20 requests/s (burst 40) before BasicAuth checks anything, which makes
+  online guessing slow, not impossible. Hash the passwords with bcrypt cost 12 and
+  use long random ones (step 4 of "First deploy"). There is no per-user lockout and
+  no alerting on failed logins.
+- The worker's own rate limiter is per process and per client address; it slows a
+  casual scraper and is not a hard quota. See "Rate limits and proxy hops".
 - The Traefik container mounts `/var/run/docker.sock` read-only (`:ro` in
   `compose.yaml`), but that is a mitigation, not a boundary: a container with any
   access to the Docker socket can still ask the daemon to launch a new, unrestricted
   container, which is equivalent to root on the host. Treat the machine running this
   stack as being at the trust level of "anyone who can compromise the traefik
-  container," and keep the Traefik image itself up to date.
+  container," and keep the Traefik image itself up to date. See "Known gaps" for the
+  hardening that is not done.
 - Redis, Postgres, and the worker are never published to the host: `compose.yaml`
   has no `ports:` entry for them, only Traefik binds 80/443. Do not add one without
   re-reading `CLAUDE.md`'s non-negotiables. Postgres in particular holds crossing
@@ -614,27 +742,72 @@ authenticated form was not re-run.
   (`plate_text` is always `None`; there is no ANPR model). That changes the risk
   profile if it ever does; see `CLAUDE.md`.
 
+## Known gaps
+
+What this deployment does **not** solve. None of these is hidden by a default; each
+is a decision someone should make deliberately.
+
+- **The Docker socket on Traefik.** Traefik's Docker provider reads the socket, and
+  `:ro` does not stop it asking the daemon for new containers (see Security notes), so
+  a compromised Traefik is root on the host. The usual reduction is a socket proxy
+  such as `docker-socket-proxy` (the `tecnativa/docker-socket-proxy` project): a small
+  container that is the only thing holding the socket and exposes just the read-only
+  endpoints Traefik needs, with Traefik pointed at it
+  (`--providers.docker.endpoint=tcp://<proxy>:2375`) instead of the socket. **Not done
+  here, and not tried**; the exact set of endpoints Traefik needs was not verified.
+- **The API token is in the worker's container labels** (that is how Traefik learns
+  what to inject), readable with `docker inspect`, and in the environment of the
+  worker and UI containers. Anyone who can talk to the Docker daemon can read it;
+  they are root-equivalent here anyway.
+- **BasicAuth has no lockout and no alerting.** It is rate-limited (429) and hashed
+  with bcrypt, not locked out per user. Whether Traefik re-hashes on every request,
+  and so what bcrypt cost 12 does to its CPU, was not observed (step 4 of "First
+  deploy").
+- **Synchronous work on the worker's event loop.** Video decode and detection run on
+  threads, but each frame's resize, tracker update, and annotation with JPEG encoding
+  run directly on the event loop (`worker/pipeline.py`, `_process_frame`). With two
+  cameras that is fine; as the camera count grows these add up on one loop and can
+  delay every pipeline, `/api/healthz`, and the MJPEG streams together. Read from the
+  code, **not profiled**. Lower `TRAFFIC_AI_FRAME_WIDTH` and `TRAFFIC_AI_TARGET_FPS`
+  first; a structural fix means moving that work off the loop.
+- **One worker, by design.** Every worker replica runs every camera and writes its own
+  copy of each crossing, so the stack is not horizontally scalable and a second
+  `worker` container would duplicate history. Capacity comes from CPU and the knobs
+  under "Resource expectations".
+- **A hard kill loses buffered history** (see "Graceful shutdown").
+
 ## What is and is not verified
 
-Pinned to branch `production-hardening`, base commit `5c67d11` plus uncommitted
-working-tree changes, 2026-10-01.
+Pinned to this branch (`production-hardening`), 2026-10-01.
 
-**Checked:** `docker compose config` parses `compose.yaml` (with `DOMAIN` and
+**Checked:** `docker compose config -q` parses `compose.yaml` (with `DOMAIN` and
 `ACME_EMAIL` set); `tests/test_deployment_config.py` asserts the structure
-(only Traefik publishes ports, both routers carry BasicAuth, the bearer is injected
-after it on the worker router, `migrate` gates the worker, every service has
-resource limits) and feeds the resolved compose environment into the real
-`Settings` production gate (an unset password and an unset token are refused; the
-UI starts with only the token). The cited `config.py` and route behavior was read
-from the code.
+(only Traefik publishes ports, both routers carry BasicAuth with a rate limit in
+front of it, the bearer is injected after it on the worker router, `migrate` gates
+the worker, every service has resource limits, the worker's stop grace period covers
+the shutdown budget read from the code) and feeds the resolved compose environment
+into the real `Settings` production gate (an unset password and an unset token are
+refused; the UI starts with only the token; the limiter and proxy-hop variables
+resolve to `Settings`' own defaults and every `TRAFFIC_AI_*` variable names a real
+setting). The Makefile's `clean` and `clean-volumes` targets were run with
+`COMPOSE=echo`, so the commands they would issue were printed, not executed. The
+workflows were parsed and checked with `actionlint`; the pinned action SHAs were
+looked up through the GitHub API on 2026-10-01. The cited `config.py`, route, and
+middleware behavior was read from the code.
 
 **Not verified, because no Docker daemon was available:** building the images; the
 `migrate` service actually running `alembic upgrade head` against Postgres, and
 `docker compose up` re-running it on upgrade; Traefik loading the users file and
-enforcing BasicAuth; the header swap on the worker router; the missing-file error
-message from `create_host_path: false`; Let's Encrypt issuance, and BasicAuth not
-interfering with it; the password-reset path (that `psql` over the container's
-local socket is trusted); the backup,
-restore, and password-reset commands; the Prometheus snippets. The `deploy.resources`
-numbers are estimates. Treat the first deploy as the verification and read
-`docker compose ps -a` and the `migrate` and `traefik` logs.
+enforcing BasicAuth; the header swap on the worker router; **the rate-limit
+middleware itself** (that Traefik accepts these labels, answers `429`, runs it before
+BasicAuth, and keys on the peer address at `depth=0`); the effect of the stop grace
+periods on a real `docker compose stop`; bcrypt cost 12's CPU effect on Traefik; the
+missing-file error message from `create_host_path: false`; Let's Encrypt issuance, and
+BasicAuth not interfering with it; the password-reset path (that `psql` over the
+container's local socket is trusted); the backup, restore, and password-reset
+commands; the Prometheus snippets and the `history_events_lost_total` alert; a real
+`make clean-volumes CONFIRM=yes`. **Also not run:** the GitHub Actions workflows
+themselves (a release run, the `workflow_call` hand-off from the release to CI, and
+the image tags the metadata step produces for a final and a pre-release tag). The
+`deploy.resources` numbers are estimates. Treat the first deploy as the verification
+and read `docker compose ps -a` and the `migrate` and `traefik` logs.

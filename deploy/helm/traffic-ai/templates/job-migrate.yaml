@@ -1,0 +1,120 @@
+{{- if .Values.migrations.enabled }}
+{{- /*
+`alembic upgrade head`, run as a Helm hook before the rest of the chart is
+applied (compose.yaml's `migrate` service, for Kubernetes). Read the notes on
+`migrations` in values.yaml first: a pre-install hook runs BEFORE this chart's
+ConfigMap, generated Secret, and ServiceAccount exist, which is why this Job
+carries its own environment, mounts no ConfigMap, and names no chart-created
+ServiceAccount.
+
+It runs the same production gate as the worker (TRAFFIC_AI_ENVIRONMENT=production
+and the same allowUnauthenticated mirror), so a missing token or a
+development-password database URL fails HERE, before any pod is replaced.
+*/ -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "traffic-ai.migrate.fullname" . }}
+  labels:
+    {{- include "traffic-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    # After the generated Secret (weight -10, templates/secret.yaml), if any.
+    helm.sh/hook-weight: "0"
+    # `before-hook-creation` clears a failed Job left by the previous attempt
+    # (its logs stay available until then); `hook-succeeded` removes a Job that
+    # finished, so a success leaves nothing behind.
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migrations.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migrations.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "traffic-ai.labels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      restartPolicy: Never
+      {{- /* The chart's ServiceAccount does not exist yet at pre-install, so it is
+      only named when the operator supplies one (create=false). Otherwise the
+      namespace `default` account is used; no token is mounted either way. */}}
+      {{- if not .Values.serviceAccount.create }}
+      serviceAccountName: {{ include "traffic-ai.serviceAccountName" . }}
+      {{- end }}
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{ include "traffic-ai.workerImage" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # The image's ENTRYPOINT is the API server; `command` replaces it.
+          # alembic.ini and migrations/ sit in the image's WORKDIR (/app).
+          command: ["alembic", "upgrade", "head"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          env:
+            - name: TRAFFIC_AI_ENVIRONMENT
+              value: "production"
+            - name: TRAFFIC_AI_LOG_LEVEL
+              value: {{ .Values.worker.env.logLevel | quote }}
+            - name: TRAFFIC_AI_LOG_FORMAT
+              value: {{ .Values.worker.env.logFormat | quote }}
+            # Mirrors the worker's, so the two cannot disagree about whether an
+            # open API is intended (the gate would otherwise refuse here).
+            - name: TRAFFIC_AI_ALLOW_UNAUTHENTICATED
+              value: {{ .Values.auth.allowUnauthenticated | quote }}
+            # Python and alembic write nothing outside /tmp (an emptyDir below).
+            - name: HOME
+              value: /tmp
+            # Same Secret references as the worker. alembic reads only the
+            # database URL; the token is required by the settings validation,
+            # not used. Required with `auth.existingSecret` (a wrong name stops
+            # the Job loudly); optional with the generated Secret, so an unset
+            # value reaches Settings, which refuses and says why.
+            - name: TRAFFIC_AI_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "traffic-ai.secretName" . }}
+                  key: {{ include "traffic-ai.secretTokenKey" . }}
+                  optional: {{ not .Values.auth.existingSecret }}
+            - name: TRAFFIC_AI_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "traffic-ai.secretName" . }}
+                  key: {{ include "traffic-ai.secretDatabaseUrlKey" . }}
+                  optional: {{ not .Values.auth.existingSecret }}
+          resources:
+            {{- toYaml .Values.migrations.resources | nindent 12 }}
+          volumeMounts:
+            # readOnlyRootFilesystem is true; /tmp is the only writable path.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

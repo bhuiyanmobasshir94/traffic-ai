@@ -2,13 +2,14 @@
 {{- /*
 A numeric minAvailable at or above the replica count leaves zero pods that may
 be evicted voluntarily, so `kubectl drain` blocks forever. Refuse to render
-that instead of shipping a budget that wedges node maintenance. (When an HPA
-owns the replica count, the Deployment's static count is not the floor, so
-the check is skipped; the HPA minReplicas is checked instead.)
+that instead of shipping a budget that wedges node maintenance. (When the UI's
+HPA owns its replica count, the Deployment's static count is not the floor, so
+the HPA minReplicas is checked instead. The worker is never autoscaled, so its
+floor is always worker.replicaCount.)
 */ -}}
 {{- $min := .Values.podDisruptionBudget.minAvailable | toString -}}
 {{- if regexMatch "^[0-9]+$" $min }}
-{{- $workerFloor := ternary .Values.autoscaling.worker.minReplicas .Values.worker.replicaCount .Values.autoscaling.enabled }}
+{{- $workerFloor := .Values.worker.replicaCount }}
 {{- $uiFloor := ternary .Values.autoscaling.ui.minReplicas .Values.ui.replicaCount .Values.autoscaling.enabled }}
 {{- if or (ge (int $min) (int $workerFloor)) (ge (int $min) (int $uiFloor)) }}
 {{- fail (printf "podDisruptionBudget.minAvailable=%s must be below the replica count of both Deployments (worker=%v, ui=%v), or node drains block forever. Use maxUnavailable instead." $min $workerFloor $uiFloor) }}

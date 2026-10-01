@@ -8,7 +8,7 @@ COMPOSE := docker compose
 # uv-managed .venv without activating it: `make test RUN="uv run"`.
 RUN ?=
 
-.PHONY: help lock lock-check sync install install-pip videos test lint fmt up down logs ps build restart clean
+.PHONY: help lock lock-check sync install install-pip videos test lint fmt up down logs ps build restart clean clean-volumes
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort \
@@ -61,5 +61,18 @@ build: ## Build (or rebuild) images without starting anything
 restart: ## Restart all services
 	$(COMPOSE) restart
 
-clean: ## Stop the stack and remove containers, networks, and volumes
+clean: down ## Same as down: remove containers and networks; volumes are KEPT
+
+# `clean` used to run `down -v`, which silently deleted the Postgres history
+# and the issued TLS certificate. Destroying data now needs its own target and an
+# explicit CONFIRM=yes, and says what it is about to destroy.
+clean-volumes: ## DESTRUCTIVE: also delete volumes (history, certs). Needs CONFIRM=yes
+	@echo "This will DELETE every named volume of this stack:"
+	@echo "  postgres-data  all stored crossing history (not recoverable without a dump)"
+	@echo "  letsencrypt    the issued TLS certificate (re-issuing is rate-limited)"
+	@echo "  model-weights  downloaded model weights (fetched again on the next start)"
+	@if [ "$(CONFIRM)" != "yes" ]; then \
+		echo "Refusing: nothing was deleted. Take a dump first (docs/DEPLOYMENT.md, Backups), then re-run with CONFIRM=yes"; \
+		exit 1; \
+	fi
 	$(COMPOSE) down -v

@@ -24,6 +24,12 @@ Secret (ingress-nginx) or the names of Middleware CRs (Traefik) that hold them.
     {{- $_ := set $annotations "nginx.ingress.kubernetes.io/auth-type" "basic" }}
     {{- $_ := set $annotations "nginx.ingress.kubernetes.io/auth-secret" (required "ingress.edgeAuth.secretName is required when ingress.edgeAuth.enabled is true" $edge.secretName) }}
     {{- $_ := set $annotations "nginx.ingress.kubernetes.io/auth-realm" $edge.realm }}
+    {{- /* BasicAuth has no lockout, so cap the guessing rate per client address.
+    A limit-rps the operator already set under ingress.annotations wins. The value
+    must be a string: an annotation cannot hold a number. */}}
+    {{- if and $edge.limitRps (not (hasKey $annotations "nginx.ingress.kubernetes.io/limit-rps")) }}
+      {{- $_ := set $annotations "nginx.ingress.kubernetes.io/limit-rps" (toString (int $edge.limitRps)) }}
+    {{- end }}
   {{- end }}
 {{- end }}
 {{- if and $traefik .Values.ingress.traefik.middlewares }}

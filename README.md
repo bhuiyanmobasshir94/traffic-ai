@@ -119,7 +119,7 @@ calls. Details and the reasoning are in `docs/DEPLOYMENT.md`.
 | `src/traffic_ai/metrics.py` | Prometheus metrics. |
 | `src/traffic_ai/ui/` | Streamlit viewer: API client, components, shared dashboard, analytics. |
 | `migrations/` | Alembic revisions for the Postgres schema. |
-| `deploy/helm/traffic-ai/` | Helm chart (worker and UI; Redis and Postgres are external). |
+| `deploy/helm/traffic-ai/` | Helm chart (worker and UI, plus a pre-install/pre-upgrade migration Job; Redis and Postgres are external). |
 
 ---
 
@@ -158,7 +158,16 @@ first boot, migrations, verification, backups, upgrades, and troubleshooting.
 - **Single server (Docker Compose):** [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
 - **Kubernetes (Helm):** [docs/KUBERNETES.md](docs/KUBERNETES.md). Read its "Edge
   authentication" section first: how much of the login can work depends on the ingress
-  controller.
+  controller, and `values-production.yaml` defaults to Traefik because it is the only one
+  where all of it does. The worker must stay at one replica (more would write duplicate
+  history); the chart enforces that for rollouts and autoscaling.
+
+`make down` (and `make clean`, its alias) stops the stack and keeps the volumes. Deleting
+them, and with them the Postgres history and the issued certificate, is a separate,
+deliberate step: `make clean-volumes CONFIRM=yes`. Both Traefik routers carry a rate limit
+in front of the login; its figures and the proxy-hop settings are in
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) ("Rate limits and proxy hops"), which also lists
+the known gaps of this deployment.
 
 ### Demo footage
 
@@ -207,6 +216,6 @@ Take your own legal advice before deploying this commercially with either detect
 
 ---
 
-*Capabilities table and module map checked against the code on branch `production-hardening`,
-base commit `5c67d11` plus uncommitted working-tree changes, 2026-10-01. If you are reading
-this much later, check `git log` before trusting it.*
+*Capabilities table and module map checked against the code on this branch
+(`production-hardening`), 2026-10-01. If you are reading this much later, check `git log`
+before trusting it.*

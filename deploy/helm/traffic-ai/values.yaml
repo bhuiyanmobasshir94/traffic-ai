@@ -4,11 +4,13 @@
 # ingress host) but, like compose.yaml, run with TRAFFIC_AI_ENVIRONMENT set
 # to "production" — see src/traffic_ai/config.py's
 # `_production_requires_hardening`. That means a plain `helm install` with
-# no overrides renders NO Secret and the worker will crash-loop at startup
-# (Settings refuses to build an unauthenticated production config) until you
-# supply an API token and a database URL — see the `auth` block below and
-# docs/KUBERNETES.md. That is deliberate: the alternative is a deployment
-# that silently serves a live camera feed to anyone.
+# no overrides renders NO Secret, and the install fails at the migration hook
+# (the Job runs the same gate; see `migrations` below) — with migrations off,
+# the worker would crash-loop at startup instead (Settings refuses to build an
+# unauthenticated production config) — until you supply an API token and a
+# database URL: see the `auth` block below and docs/KUBERNETES.md. That is
+# deliberate: the alternative is a deployment that silently serves a live
+# camera feed to anyone.
 #
 # For a concrete production overlay, see values-production.yaml.
 
@@ -71,8 +73,23 @@ containerSecurityContext:
     type: RuntimeDefault
 
 worker:
+  # MUST stay 1. Every worker replica runs EVERY camera pipeline, so a second
+  # replica counts the same vehicles again: each crossing is written to Postgres
+  # once per replica (duplicate history) and the replicas overwrite each other's
+  # live counters in Redis. It is not scale-out and not safe redundancy. The
+  # Deployment uses `strategy: Recreate` so a rollout never runs two at once, and
+  # the worker is never autoscaled (see `autoscaling` below). To handle more
+  # cameras, raise `resources` / tune `env` instead.
   replicaCount: 1
   containerPort: 8000
+
+  # Time Kubernetes waits between SIGTERM and SIGKILL. The worker's shutdown
+  # waits up to 10s for the pipelines to stop and up to 10s more for the history
+  # writer to flush its buffer to Postgres, after a 5s request drain: 25s worst
+  # case. The Kubernetes default (30s) already covers that; it is set explicitly
+  # so it cannot be lowered by accident, and matches compose.yaml's
+  # `stop_grace_period`. Never set this below ~25 while persistence is on.
+  terminationGracePeriodSeconds: 30
 
   service:
     type: ClusterIP
@@ -106,7 +123,17 @@ worker:
     detectEveryNFrames: "2"
     frameWidth: "960"
     metricsEnabled: "true"
+    # The worker's own per-client limiter (Settings.rate_limit_*). Strings, like
+    # every value in this block, because they land in a ConfigMap.
     rateLimitEnabled: "true"
+    rateLimitRequests: "120"
+    rateLimitStreamRequests: "10"
+    # How many reverse proxies sit between the client and the worker, so the
+    # limiter keys on the real client address instead of the last proxy's. 1 is
+    # one ingress controller, which is what this chart assumes. A cloud load
+    # balancer in front of the controller makes it 2. Too low and every client
+    # shares the proxy's bucket; see docs/KUBERNETES.md, "Rate limits and proxy hops".
+    trustedProxyHops: "1"
 
   # Extra raw env entries (full corev1.EnvVar shape) for anything not covered
   # above — e.g. TRAFFIC_AI_ANPR_ENABLED, confidence/iou thresholds.
@@ -163,6 +190,10 @@ worker:
 ui:
   replicaCount: 1
   containerPort: 8501
+
+  # Streamlit has nothing to flush; this only has to outlast open WebSocket
+  # sessions closing. Matches compose.yaml's `stop_grace_period` for the ui.
+  terminationGracePeriodSeconds: 15
 
   service:
     type: ClusterIP
@@ -234,6 +265,43 @@ auth:
   # only to run the API open on purpose.
   allowUnauthenticated: false
 
+# Database schema migrations. The worker never migrates on its own (it only
+# builds a Database), so without this nothing creates the history tables.
+#
+# When enabled, a Helm hook Job (templates/job-migrate.yaml) runs
+# `alembic upgrade head` from the worker image BEFORE every `helm install` and
+# `helm upgrade` applies the rest of the chart; a failed migration fails the
+# release and the old pods keep running. It is the Kubernetes form of
+# compose.yaml's `migrate` service.
+#
+# Because it runs before the chart's own objects exist, it cannot use the
+# ConfigMap or the ServiceAccount (both are created after pre-install hooks): it
+# sets its own environment, runs as the namespace `default` ServiceAccount (or
+# `serviceAccount.name` when `serviceAccount.create` is false), and reads the
+# credentials from `auth.existingSecret`. With a chart-GENERATED Secret
+# (auth.apiToken / auth.databaseUrl) the Secret itself becomes a pre-install
+# hook with an earlier weight, so it exists when the Job starts; see
+# templates/secret.yaml and docs/KUBERNETES.md, "Migrations".
+#
+# Migrations run on the NEW image while the OLD pods are still serving (upgrade),
+# so each revision must stay compatible with the previous release's code: add,
+# do not rename or drop, within one release.
+migrations:
+  enabled: true
+  # A transient failure (the database still starting) is retried this many times.
+  backoffLimit: 2
+  # Hard cap on the whole Job. Below Helm's default 5m hook timeout so the Job
+  # fails with its own reason instead of Helm giving up on it.
+  activeDeadlineSeconds: 240
+  # compose.yaml's `migrate` limits. Alembic over asyncpg is small and short-lived.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
 ingress:
   enabled: true
   className: nginx
@@ -268,16 +336,26 @@ ingress:
     # ingress-nginx only. A Secret you create in this namespace, with the
     # htpasswd lines under the key `auth`:
     #   kubectl -n <ns> create secret generic traffic-ai-basic-auth \
-    #     --from-file=auth=<(htpasswd -nbB admin '<password>')
+    #     --from-file=auth=<(htpasswd -nbB -C 12 admin '<password>')
     # Referenced by name only; never rendered by this chart. Required when
     # edgeAuth.enabled and className is not "traefik".
     secretName: ""
     # Shown in the browser's login prompt. No double quotes (nginx quotes it).
     realm: "Traffic AI - Authentication Required"
+    # ingress-nginx only: requests per second allowed from one client address
+    # (nginx.ingress.kubernetes.io/limit-rps), applied when edgeAuth is on.
+    # BasicAuth has no lockout of its own, so without a limit the login can be
+    # guessed at wire speed. 0 omits the annotation. An annotation you set
+    # yourself under `ingress.annotations` wins over this value. nginx's burst
+    # allowance is its own default (5x this value); the figure is an estimate,
+    # not a measurement. On Traefik this has no effect: add a RateLimit
+    # Middleware CR in front of BasicAuth instead (docs/KUBERNETES.md).
+    limitRps: 20
 
   # Traefik as the ingress controller (className: traefik). The chart does NOT
   # template Middleware CRDs: you create them, then name them here. Format is
-  # <namespace>-<name>@kubernetescrd, in execution order. BasicAuth FIRST, then
+  # <namespace>-<name>@kubernetescrd, in execution order. RATE LIMIT FIRST (so
+  # login guesses are throttled before they are checked), then BasicAuth, then
   # the bearer injection, for the same reason as compose.yaml: the check must
   # run against the browser's header before it is replaced. See
   # docs/KUBERNETES.md for the Middleware YAML.
@@ -289,14 +367,18 @@ ingress:
     middlewares: []
 
 autoscaling:
-  # Opt-in. When enabled, this chart sets replicaCount via the HPA instead
-  # of worker.replicaCount / ui.replicaCount — leave the Deployment
-  # replicas at their default and let the HPA own scaling from there.
+  # Opt-in, and for the UI ONLY. When enabled, an HPA owns the UI's replica
+  # count instead of ui.replicaCount (leave the Deployment's at its default and
+  # let the HPA scale from there). There is deliberately no worker HPA: each
+  # worker replica runs every camera pipeline and writes its own history, so a
+  # second replica duplicates crossings instead of adding capacity. See
+  # `worker.replicaCount`.
   enabled: false
   worker:
-    minReplicas: 1
-    maxReplicas: 4
-    targetCPUUtilizationPercentage: 70
+    # A guard, not a feature. Setting this true makes the chart refuse to render
+    # (templates/hpa.yaml) rather than quietly create something that corrupts
+    # history. Scale a worker UP with `worker.resources` and `worker.env`.
+    enabled: false
   ui:
     minReplicas: 1
     maxReplicas: 3

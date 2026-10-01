@@ -35,6 +35,14 @@ shared fullname so both sides of compose.yaml's topology are addressable.
 {{- end -}}
 
 {{/*
+The migration hook Job. A fixed name per release on purpose: Helm's
+`before-hook-creation` delete policy finds the previous attempt by name.
+*/}}
+{{- define "traffic-ai.migrate.fullname" -}}
+{{- printf "%s-migrate" (include "traffic-ai.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/*
 Chart name and version, for the helm.sh/chart label.
 */}}
 {{- define "traffic-ai.chart" -}}
