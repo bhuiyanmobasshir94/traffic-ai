@@ -1,0 +1,88 @@
+# Production overlay. Layer it over the defaults:
+#
+#   helm upgrade --install traffic-ai deploy/helm/traffic-ai \
+#     -n traffic-ai --create-namespace \
+#     -f deploy/helm/traffic-ai/values-production.yaml \
+#     --set ingress.host=traffic.example.org
+#
+# Nothing secret lives in this file. The API token and the database URL come
+# from a Secret you create out-of-band and name below — without it the worker
+# refuses to start (src/traffic_ai/config.py, `_production_requires_hardening`:
+# a production config needs TRAFFIC_AI_API_TOKEN and a database URL that does
+# not carry the development password). Create it first:
+#
+#   kubectl -n traffic-ai create secret generic traffic-ai-secrets \
+#     --from-literal=api-token="$(openssl rand -hex 32)" \
+#     --from-literal=database-url="postgresql+asyncpg://USER:PASS@HOST:5432/traffic_ai"
+
+image:
+  # Your registry, e.g. "registry.example.com/traffic-ai". Tags are pinned to
+  # an exact release, never :latest.
+  registry: ""
+  pullPolicy: IfNotPresent
+  worker:
+    repository: traffic-ai-worker
+    tag: "1.1.0"
+  ui:
+    repository: traffic-ai-ui
+    tag: "1.1.0"
+
+# External Redis, by URL (managed service or an in-cluster release). The
+# value below is a placeholder shape, not a working address — point it at
+# yours. If the URL embeds a password, override TRAFFIC_AI_REDIS_URL through
+# worker.extraEnv / ui.extraEnv with a secretKeyRef instead of writing it here.
+redis:
+  url: "redis://redis-master.redis.svc.cluster.local:6379/0"
+
+auth:
+  # Referenced by NAME only. The values stay in the cluster.
+  existingSecret: traffic-ai-secrets
+  existingSecretTokenKey: api-token
+  existingSecretDatabaseUrlKey: database-url
+  allowUnauthenticated: false
+
+ingress:
+  enabled: true
+  className: nginx
+  # Deliberately empty: the chart refuses to render without a real host, so a
+  # forgotten --set ingress.host fails loudly instead of deploying a
+  # placeholder name.
+  host: ""
+  tls:
+    enabled: true
+    # Pre-created kubernetes.io/tls Secret, or one your certificate manager
+    # populates. This chart does not install cert-manager or its CRDs.
+    secretName: traffic-ai-tls
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # Streamlit holds a WebSocket (/_stcore/stream) open and the worker serves
+    # long-lived MJPEG streams; the controller's 60s default timeouts would
+    # cut both. Buffering off so frames reach the browser as they are produced.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+
+worker:
+  # One replica on purpose. Each worker replica runs every camera pipeline
+  # and publishes to the same Redis keys, so a second replica doubles the CPU
+  # bill without adding capacity — it is redundancy, not scale-out.
+  replicaCount: 1
+
+ui:
+  replicaCount: 2
+
+# Voluntary disruptions (node drains) may take one pod of each Deployment at
+# a time. maxUnavailable, not minAvailable: with worker.replicaCount 1 a
+# minAvailable of 1 would make the worker unevictable and block drains.
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+# Default-deny ingress to the worker. Check the selectors match your ingress
+# controller (these are ingress-nginx's) and that your CNI enforces policy.
+networkPolicy:
+  enabled: true
+  ingressControllerNamespaceSelector:
+    kubernetes.io/metadata.name: ingress-nginx
+  ingressControllerPodSelector:
+    app.kubernetes.io/name: ingress-nginx

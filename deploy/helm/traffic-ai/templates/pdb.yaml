@@ -1,0 +1,50 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+{{- /*
+A numeric minAvailable at or above the replica count leaves zero pods that may
+be evicted voluntarily, so `kubectl drain` blocks forever. Refuse to render
+that instead of shipping a budget that wedges node maintenance. (When an HPA
+owns the replica count, the Deployment's static count is not the floor, so
+the check is skipped; the HPA minReplicas is checked instead.)
+*/ -}}
+{{- $min := .Values.podDisruptionBudget.minAvailable | toString -}}
+{{- if regexMatch "^[0-9]+$" $min }}
+{{- $workerFloor := ternary .Values.autoscaling.worker.minReplicas .Values.worker.replicaCount .Values.autoscaling.enabled }}
+{{- $uiFloor := ternary .Values.autoscaling.ui.minReplicas .Values.ui.replicaCount .Values.autoscaling.enabled }}
+{{- if or (ge (int $min) (int $workerFloor)) (ge (int $min) (int $uiFloor)) }}
+{{- fail (printf "podDisruptionBudget.minAvailable=%s must be below the replica count of both Deployments (worker=%v, ui=%v), or node drains block forever. Use maxUnavailable instead." $min $workerFloor $uiFloor) }}
+{{- end }}
+{{- end }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "traffic-ai.worker.fullname" . }}
+  labels:
+    {{- include "traffic-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  {{- if .Values.podDisruptionBudget.minAvailable }}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "traffic-ai.worker.selectorLabels" . | nindent 6 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "traffic-ai.ui.fullname" . }}
+  labels:
+    {{- include "traffic-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ui
+spec:
+  {{- if .Values.podDisruptionBudget.minAvailable }}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "traffic-ai.ui.selectorLabels" . | nindent 6 }}
+{{- end }}

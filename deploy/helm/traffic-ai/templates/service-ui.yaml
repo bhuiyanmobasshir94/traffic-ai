@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "traffic-ai.ui.fullname" . }}
+  labels:
+    {{- include "traffic-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ui
+spec:
+  type: {{ .Values.ui.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.ui.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "traffic-ai.ui.selectorLabels" . | nindent 4 }}

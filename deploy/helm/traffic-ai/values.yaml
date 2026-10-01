@@ -1,0 +1,288 @@
+# Default values for traffic-ai.
+#
+# These defaults mirror compose.yaml's topology (worker + ui behind one
+# ingress host) but, like compose.yaml, run with TRAFFIC_AI_ENVIRONMENT set
+# to "production" — see src/traffic_ai/config.py's
+# `_production_requires_hardening`. That means a plain `helm install` with
+# no overrides renders NO Secret and the worker will crash-loop at startup
+# (Settings refuses to build an unauthenticated production config) until you
+# supply an API token and a database URL — see the `auth` block below and
+# docs/KUBERNETES.md. That is deliberate: the alternative is a deployment
+# that silently serves a live camera feed to anyone.
+#
+# For a concrete production overlay, see values-production.yaml.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  # Set to your registry, e.g. "registry.example.com/traffic-ai". Left empty
+  # by default so repository below can be a fully-qualified name instead.
+  registry: ""
+  pullPolicy: IfNotPresent
+  worker:
+    repository: traffic-ai-worker
+    tag: "1.1.0"
+  ui:
+    repository: traffic-ai-ui
+    tag: "1.1.0"
+
+imagePullSecrets: []
+
+serviceAccount:
+  # A dedicated ServiceAccount with no mounted token auto-projection needed
+  # beyond the default, and no RBAC bindings — this chart grants no
+  # permissions, it only identifies the pods.
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Pod-level security context, applied to both Deployments. Matches
+# docker/Dockerfile.{worker,ui}'s baked-in `app` user (uid/gid 1000) exactly
+# — runAsNonRoot would otherwise reject a pod whose image already refuses to
+# run as root.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level security context, applied to both the worker and ui
+# containers. readOnlyRootFilesystem is true for both — see the emptyDir
+# volumes each Deployment mounts for the paths that genuinely need writes.
+containerSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+  seccompProfile:
+    type: RuntimeDefault
+
+worker:
+  replicaCount: 1
+  containerPort: 8000
+
+  service:
+    type: ClusterIP
+    port: 8000
+
+  # CPU inference is the dominant cost on this path (docs/DEPLOYMENT.md): two
+  # streams at target_fps=12 with detect_every_n_frames=2 keep one core busy
+  # most of the time, and torch/opencv/ultralytics buffers routinely sit
+  # above 1Gi RSS even at idle. Request enough CPU that the scheduler does
+  # not co-locate this pod somewhere it will be throttled mid-inference, and
+  # cap memory high enough that a transient spike (a burst of detections)
+  # does not OOM-kill a pod that was otherwise healthy.
+  resources:
+    requests:
+      cpu: "1"
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+  # Mirrors compose.yaml's `worker.environment`, minus the two secret-backed
+  # values (TRAFFIC_AI_API_TOKEN, TRAFFIC_AI_DATABASE_URL — see `auth` below)
+  # and TRAFFIC_AI_REDIS_URL (see top-level `redis.url`).
+  env:
+    logLevel: INFO
+    logFormat: json
+    videoDir: /data/videos
+    modelWeights: /app/weights/yolov8n.pt
+    device: cpu
+    targetFps: "12"
+    detectEveryNFrames: "2"
+    frameWidth: "960"
+    metricsEnabled: "true"
+    rateLimitEnabled: "true"
+
+  # Extra raw env entries (full corev1.EnvVar shape) for anything not covered
+  # above — e.g. TRAFFIC_AI_ANPR_ENABLED, confidence/iou thresholds.
+  extraEnv: []
+
+  # The first start can download YOLO/torchvision model weights before the
+  # pipeline reaches RUNNING, and /api/readyz correctly returns 503 until it
+  # does (src/traffic_ai/config.py, docs/DEPLOYMENT.md). A startupProbe absorbs
+  # that one-time delay with its own budget so liveness/readiness can stay
+  # tight once the container is actually up.
+  startupProbe:
+    enabled: true
+    path: /api/healthz
+    periodSeconds: 5
+    failureThreshold: 60 # up to 5 minutes for a cold weights download
+  livenessProbe:
+    path: /api/healthz
+    initialDelaySeconds: 5
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 5
+  readinessProbe:
+    # /api/readyz returns 503 until a pipeline is RUNNING — correct, not a
+    # bug: it keeps the pod out of the Service without restarting it. The
+    # generous failureThreshold means a slow-starting pipeline is not
+    # mistaken for a broken one. (Readiness only begins once the
+    # startupProbe above has succeeded.)
+    path: /api/readyz
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 30
+
+  # /app/weights must be writable (model weights land here) even though
+  # readOnlyRootFilesystem is true; /tmp is the other path anything in the
+  # container might reasonably need to write to. Both are emptyDir: weights
+  # are re-downloaded on pod restart by design, same as compose.yaml's
+  # model-weights named volume being the only thing that survives a restart
+  # there — a PVC can be swapped in via `worker.weightsVolume` below if
+  # re-downloading on every restart is too slow for your environment.
+  weightsVolume:
+    sizeLimitEmptyDir: 2Gi
+    existingClaim: ""
+
+  # Demo footage (compose.yaml mounts ./data/videos read-only). No PVC is
+  # provisioned by this chart — point `existingClaim` at one you have
+  # already populated, or leave disabled and expect per-camera decode
+  # errors (CameraPipeline fails visibly rather than crashing; see
+  # CLAUDE.md "Fail visibly").
+  videosVolume:
+    enabled: false
+    existingClaim: ""
+
+ui:
+  replicaCount: 1
+  containerPort: 8501
+
+  service:
+    type: ClusterIP
+    port: 8501
+
+  # Streamlit itself is light; it only renders state the worker already
+  # computed and proxies one MJPEG stream per viewer.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  env:
+    logLevel: INFO
+    logFormat: json
+
+  extraEnv: []
+
+  livenessProbe:
+    path: /_stcore/health
+    initialDelaySeconds: 10
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readinessProbe:
+    path: /_stcore/health
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+# Redis is external by default — a managed service or an in-cluster release
+# this chart does not vendor (see docs/KUBERNETES.md for both options).
+# Point this at whatever actually answers on that URL; compose.yaml's own
+# default (`redis://redis:6379/0`) only resolves inside the compose network
+# and will not resolve in-cluster unless you name a Service `redis` too.
+redis:
+  url: "redis://redis:6379/0"
+
+# Postgres is external by default, same reasoning as redis above. No URL
+# default is provided here on purpose — see `auth` below, which is the only
+# supported way to supply it (it is a secret, same as the API token).
+database: {}
+
+auth:
+  # Preferred path: pre-create a Secret yourself —
+  #   kubectl create secret generic traffic-ai-secrets \
+  #     --from-literal=api-token="$(openssl rand -hex 32)" \
+  #     --from-literal=database-url="postgresql+asyncpg://user:pass@host:5432/traffic_ai"
+  # — and reference it by name here. Nothing it contains ever appears in
+  # values.yaml, a values file, or `helm template`/`helm get values` output.
+  existingSecret: ""
+  existingSecretTokenKey: api-token
+  existingSecretDatabaseUrlKey: database-url
+
+  # Convenience path for non-production use only: the chart renders a
+  # Secret (templates/secret.yaml) from the two values below when
+  # `existingSecret` is empty. Values files are routinely committed to git
+  # and shared outside the cluster — treat anything set here as already
+  # leaked. Prefer `existingSecret` for anything that matters.
+  apiToken: ""
+  databaseUrl: ""
+
+  # src/traffic_ai/config.py refuses to start in production without either a
+  # token or this set to true. Defaults to false (fail closed); set true
+  # only to run the API open on purpose.
+  allowUnauthenticated: false
+
+ingress:
+  enabled: true
+  className: nginx
+  # Must be overridden with a real, resolvable hostname before deploying
+  # anywhere but a scratch cluster.
+  host: traffic.example.local
+  annotations: {}
+  tls:
+    enabled: false
+    secretName: ""
+
+autoscaling:
+  # Opt-in. When enabled, this chart sets replicaCount via the HPA instead
+  # of worker.replicaCount / ui.replicaCount — leave the Deployment
+  # replicas at their default and let the HPA own scaling from there.
+  enabled: false
+  worker:
+    minReplicas: 1
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+  ui:
+    minReplicas: 1
+    maxReplicas: 3
+    targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  # Opt-in. Defaults to maxUnavailable rather than minAvailable: a
+  # minAvailable equal to (or above) replicaCount makes every pod
+  # "unevictable" and blocks node drains outright when replicaCount is 1,
+  # which is this chart's own default. maxUnavailable: 1 degrades
+  # gracefully at any replica count instead, including 1.
+  enabled: false
+  maxUnavailable: 1
+  # Set this instead (and leave maxUnavailable unset) only once
+  # replicaCount is comfortably above 1 for both Deployments.
+  minAvailable: ""
+
+networkPolicy:
+  # Opt-in default-deny: once enabled, only the UI and your ingress
+  # controller may reach the worker on its port; everything else is
+  # refused. Adjust the selectors below to match your actual ingress
+  # controller — these are ingress-nginx's own labels/namespace, which is
+  # the most common default but not universal (see docs/KUBERNETES.md).
+  enabled: false
+  ingressControllerNamespaceSelector:
+    kubernetes.io/metadata.name: ingress-nginx
+  ingressControllerPodSelector:
+    app.kubernetes.io/name: ingress-nginx
+  # Additional `from` peers (full NetworkPolicyPeer shape) allowed to reach
+  # the worker — e.g. a Prometheus that scrapes /api/metrics, which this
+  # policy otherwise blocks.
+  extraIngressFrom: []

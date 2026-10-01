@@ -1,0 +1,47 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "traffic-ai.fullname" . }}
+  labels:
+    {{- include "traffic-ai.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ required "ingress.host is required" .Values.ingress.host | quote }}
+      secretName: {{ required "ingress.tls.secretName is required when ingress.tls.enabled is true" .Values.ingress.tls.secretName | quote }}
+  {{- end }}
+  rules:
+    - host: {{ required "ingress.host is required" .Values.ingress.host | quote }}
+      http:
+        paths:
+          # /api MUST stay first. Both entries are `Prefix`, and they overlap
+          # (every /api/... request also matches /). Controllers disagree on
+          # how they break that tie: some pick the longest (most specific)
+          # matching path regardless of declaration order, others honor the
+          # order the paths are written in. Declaring /api before / is
+          # correct under both, and is the equivalent of compose.yaml giving
+          # the worker's Traefik router priority 100 over the UI's 1.
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "traffic-ai.worker.fullname" . }}
+                port:
+                  name: http
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "traffic-ai.ui.fullname" . }}
+                port:
+                  name: http
+{{- end }}

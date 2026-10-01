@@ -1,0 +1,45 @@
+{{- if .Values.networkPolicy.enabled }}
+# Default-deny ingress to the worker. Selecting the worker pods with a
+# policy that lists `Ingress` flips them to deny-by-default; the rules below
+# are the only exceptions. The UI pods are not selected, so they stay
+# reachable from the ingress controller as before.
+#
+# Requires a CNI that enforces NetworkPolicy (Calico, Cilium, ...). On one
+# that does not (e.g. plain flannel) this object is accepted and silently
+# does nothing.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "traffic-ai.worker.fullname" . }}
+  labels:
+    {{- include "traffic-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "traffic-ai.worker.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # The UI, for its server-to-server calls (TRAFFIC_AI_API_INTERNAL_URL).
+        # No namespaceSelector: same namespace only.
+        - podSelector:
+            matchLabels:
+              {{- include "traffic-ai.ui.selectorLabels" . | nindent 14 }}
+        # The ingress controller, which carries browser traffic for /api.
+        # namespaceSelector and podSelector in ONE entry are ANDed: only pods
+        # with these labels in namespaces with those labels match.
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.ingressControllerNamespaceSelector | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.ingressControllerPodSelector | nindent 14 }}
+        {{- with .Values.networkPolicy.extraIngressFrom }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.worker.containerPort }}
+{{- end }}

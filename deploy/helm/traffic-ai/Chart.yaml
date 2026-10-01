@@ -1,0 +1,17 @@
+apiVersion: v2
+name: traffic-ai
+description: >-
+  Toll-booth and traffic-congestion monitoring — a FastAPI inference worker
+  and a Streamlit dashboard behind one ingress host, matching the topology
+  proven by compose.yaml (worker on /api, UI everywhere else).
+type: application
+version: 1.0.0
+appVersion: "1.1.0"
+home: https://github.com/bhuiyanmobasshir94/traffic-ai
+keywords:
+  - traffic
+  - computer-vision
+  - fastapi
+  - streamlit
+maintainers:
+  - name: bhuiyanmobasshir94

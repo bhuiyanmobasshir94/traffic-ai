@@ -1,0 +1,41 @@
+traffic-ai {{ .Chart.AppVersion }} deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+{{- if .Values.ingress.enabled }}
+
+Reach the dashboard at:
+  {{ if .Values.ingress.tls.enabled }}https{{ else }}http{{ end }}://{{ .Values.ingress.host }}/
+and the API at:
+  {{ if .Values.ingress.tls.enabled }}https{{ else }}http{{ end }}://{{ .Values.ingress.host }}/api/healthz
+{{- else }}
+
+Ingress is disabled. Reach the services from inside the cluster, or:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "traffic-ai.ui.fullname" . }} {{ .Values.ui.service.port }}
+{{- end }}
+
+{{- if and (not .Values.auth.existingSecret) (not .Values.auth.apiToken) (not .Values.auth.allowUnauthenticated) }}
+
+WARNING: no API token is configured. The worker runs with
+TRAFFIC_AI_ENVIRONMENT=production and will refuse to start without one.
+Create a Secret and reference it:
+  kubectl -n {{ .Release.Namespace }} create secret generic traffic-ai-secrets \
+    --from-literal=api-token="$(openssl rand -hex 32)" \
+    --from-literal=database-url="postgresql+asyncpg://USER:PASS@HOST:5432/traffic_ai"
+  helm upgrade {{ .Release.Name }} <chart> --reuse-values --set auth.existingSecret=traffic-ai-secrets
+{{- end }}
+
+{{- if and (not .Values.auth.existingSecret) (or .Values.auth.apiToken .Values.auth.databaseUrl) }}
+
+WARNING: credentials were supplied through chart values, not an existing
+Secret. Values files get committed and shared; prefer auth.existingSecret.
+{{- end }}
+
+{{- if not .Values.ingress.tls.enabled }}
+
+NOTE: TLS is not enabled on the ingress. Set ingress.tls.enabled and
+ingress.tls.secretName before exposing this to the internet.
+{{- end }}
+
+First start can take several minutes while model weights download. The pod
+reports not-ready (/api/readyz -> 503) until a pipeline is RUNNING; that is
+expected. Watch it with:
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }} -w

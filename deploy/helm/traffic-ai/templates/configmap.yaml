@@ -1,0 +1,62 @@
+# Non-secret settings only. The API token and database URL live in a Secret
+# (see secret.yaml / values.yaml `auth`) and are injected as individual env
+# entries by the worker Deployment; nothing in this file is sensitive.
+#
+# A pod's own `env:` entries take precedence over `envFrom`, which is how
+# `extraEnv` overrides any value here (e.g. a Redis URL carrying a password
+# can be swapped for a secretKeyRef without editing this template).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "traffic-ai.worker.fullname" . }}
+  labels:
+    {{- include "traffic-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+data:
+  # compose.yaml sets production on both services unconditionally. Settings
+  # refuses to build an unauthenticated or default-password production
+  # config, so this is what makes the chart fail closed.
+  TRAFFIC_AI_ENVIRONMENT: "production"
+  TRAFFIC_AI_LOG_LEVEL: {{ .Values.worker.env.logLevel | quote }}
+  TRAFFIC_AI_LOG_FORMAT: {{ .Values.worker.env.logFormat | quote }}
+  TRAFFIC_AI_REDIS_URL: {{ .Values.redis.url | quote }}
+  TRAFFIC_AI_VIDEO_DIR: {{ .Values.worker.env.videoDir | quote }}
+  TRAFFIC_AI_MODEL_WEIGHTS: {{ .Values.worker.env.modelWeights | quote }}
+  TRAFFIC_AI_DEVICE: {{ .Values.worker.env.device | quote }}
+  TRAFFIC_AI_TARGET_FPS: {{ .Values.worker.env.targetFps | quote }}
+  TRAFFIC_AI_DETECT_EVERY_N_FRAMES: {{ .Values.worker.env.detectEveryNFrames | quote }}
+  TRAFFIC_AI_FRAME_WIDTH: {{ .Values.worker.env.frameWidth | quote }}
+  TRAFFIC_AI_METRICS_ENABLED: {{ .Values.worker.env.metricsEnabled | quote }}
+  TRAFFIC_AI_RATE_LIMIT_ENABLED: {{ .Values.worker.env.rateLimitEnabled | quote }}
+  TRAFFIC_AI_ALLOW_UNAUTHENTICATED: {{ .Values.auth.allowUnauthenticated | quote }}
+  # Both libraries write caches/config on first use and the root filesystem
+  # is read-only, so both are pointed at the writable /app/weights volume.
+  # YOLO_CONFIG_DIR is the ultralytics settings file (already baked into the
+  # image by docker/Dockerfile.worker, repeated here so it is explicit);
+  # TORCH_HOME is where torchvision caches the pretrained detector weights
+  # the DEFAULT detector downloads on first start.
+  YOLO_CONFIG_DIR: "/app/weights"
+  TORCH_HOME: "/app/weights"
+  # Any other library that writes under $HOME lands on the /tmp emptyDir.
+  HOME: "/tmp"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "traffic-ai.ui.fullname" . }}
+  labels:
+    {{- include "traffic-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ui
+data:
+  TRAFFIC_AI_ENVIRONMENT: "production"
+  TRAFFIC_AI_LOG_LEVEL: {{ .Values.ui.env.logLevel | quote }}
+  TRAFFIC_AI_LOG_FORMAT: {{ .Values.ui.env.logFormat | quote }}
+  TRAFFIC_AI_REDIS_URL: {{ .Values.redis.url | quote }}
+  # Server-to-server, in-cluster: the worker Service (compose.yaml's
+  # `http://worker:8000`).
+  TRAFFIC_AI_API_INTERNAL_URL: {{ printf "http://%s:%v" (include "traffic-ai.worker.fullname" .) .Values.worker.service.port | quote }}
+  # Browser-facing and relative, so it rides the same Host/TLS as the UI —
+  # one DNS record, one certificate, no CORS. This is why the ingress must
+  # route /api to the worker on the same host.
+  TRAFFIC_AI_API_PUBLIC_URL: "/api"
+  HOME: "/tmp"

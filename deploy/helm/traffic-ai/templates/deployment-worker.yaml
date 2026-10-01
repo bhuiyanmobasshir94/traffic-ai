@@ -1,0 +1,144 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "traffic-ai.worker.fullname" . }}
+  labels:
+    {{- include "traffic-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.worker.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "traffic-ai.worker.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # Roll the pods when non-secret config or the generated Secret changes.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if not .Values.auth.existingSecret }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "traffic-ai.labels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "traffic-ai.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: worker
+          image: {{ include "traffic-ai.workerImage" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.worker.containerPort }}
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "traffic-ai.worker.fullname" . }}
+          env:
+            # Secret-backed. With `auth.existingSecret` the references are
+            # required (a wrong name or key stops the pod loudly). With the
+            # generated Secret they are optional, so an unset value reaches
+            # Settings, which refuses to start in production and says why.
+            - name: TRAFFIC_AI_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "traffic-ai.secretName" . }}
+                  key: {{ include "traffic-ai.secretTokenKey" . }}
+                  optional: {{ not .Values.auth.existingSecret }}
+            - name: TRAFFIC_AI_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "traffic-ai.secretName" . }}
+                  key: {{ include "traffic-ai.secretDatabaseUrlKey" . }}
+                  optional: {{ not .Values.auth.existingSecret }}
+            {{- with .Values.worker.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          # startupProbe holds liveness/readiness off until the process first
+          # answers, absorbing a cold model-weights download. /api/readyz
+          # then returns 503 until a pipeline is RUNNING, which keeps the pod
+          # out of the Service without restarting it.
+          {{- if .Values.worker.startupProbe.enabled }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.worker.startupProbe.path }}
+              port: http
+            periodSeconds: {{ .Values.worker.startupProbe.periodSeconds }}
+            failureThreshold: {{ .Values.worker.startupProbe.failureThreshold }}
+            timeoutSeconds: 5
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.worker.livenessProbe.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.worker.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.worker.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.worker.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.worker.livenessProbe.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.worker.readinessProbe.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.worker.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.worker.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.worker.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.worker.readinessProbe.failureThreshold }}
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+          volumeMounts:
+            # readOnlyRootFilesystem is true; these are the only writable paths.
+            - name: tmp
+              mountPath: /tmp
+            - name: weights
+              mountPath: /app/weights
+            {{- if .Values.worker.videosVolume.enabled }}
+            - name: videos
+              mountPath: {{ .Values.worker.env.videoDir }}
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: weights
+          {{- if .Values.worker.weightsVolume.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.worker.weightsVolume.existingClaim }}
+          {{- else }}
+          emptyDir:
+            sizeLimit: {{ .Values.worker.weightsVolume.sizeLimitEmptyDir }}
+          {{- end }}
+        {{- if .Values.worker.videosVolume.enabled }}
+        - name: videos
+          persistentVolumeClaim:
+            claimName: {{ required "worker.videosVolume.existingClaim is required when worker.videosVolume.enabled is true" .Values.worker.videosVolume.existingClaim }}
+            readOnly: true
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
